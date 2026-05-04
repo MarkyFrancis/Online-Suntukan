@@ -1,0 +1,1391 @@
+import Phaser from "phaser";
+import {
+  allPortraitAssets,
+  allPoseAssets,
+  allSpecialAssets,
+  allVoicePaths,
+  fighterManifests,
+  getFighterManifest,
+  getStageManifest,
+  menuMusicManifest,
+  sfxManifest,
+  shouldFlipFighterAsset,
+  shouldFlipSpecialFrameAsset,
+  shouldFlipSpecialAsset,
+  stageManifests,
+  type FighterAssetManifest,
+  type PoseAsset,
+  type PoseName,
+  type SpecialEffectKind,
+} from "../../game/assets/manifest";
+import { audioConfig } from "../../game/config/audio";
+import { aiDifficulty } from "../../game/config/ai";
+import {
+  SPECIAL_ANIMATION_FRAME_RATE,
+  SPECIAL_FRAME_MS,
+  SPECIAL_INTRO_PAUSE_MS,
+  SPECIAL_NAME_DISPLAY_MS,
+  SPECIAL_RECOVERY_MS,
+} from "../../game/config/attacks";
+import { createKeyboardBindings, emptyInput, readInput, type KeyboardBindings } from "../../game/input/bindings";
+import { FighterAi } from "../../game/simulation/ai";
+import { RoundSimulation } from "../../game/simulation/RoundSimulation";
+import type { FighterId, FighterState, GameMode, RoundSnapshot } from "../../game/simulation/types";
+import { DomUi, type MatchScore, type PauseAction, type RoundSelection, type SelectSnapshot } from "../../ui/dom";
+
+type FighterView = {
+  sprite: Phaser.GameObjects.Sprite;
+  shadow: Phaser.GameObjects.Ellipse;
+  lastPose: PoseName | null;
+  effect: {
+    offsetX: number;
+    offsetY: number;
+    angle: number;
+    scale: number;
+  };
+};
+
+type ScreenState = "title" | "characters" | "stage" | "playing" | "paused" | "match-over";
+type MenuKeys = Record<
+  "enter" | "escape" | "space" | "p1Up" | "p1Down" | "p2Up" | "p2Down" | "p1Back" | "p2Back",
+  Phaser.Input.Keyboard.Key
+>;
+
+type VoicePolicy = {
+  hurtReadyAtMs: number;
+  koPlayed: boolean;
+};
+
+type WindowWithWebkitAudio = Window & {
+  AudioContext?: typeof AudioContext;
+  webkitAudioContext?: typeof AudioContext;
+};
+
+const voiceKeyByPath = new Map<string, string>();
+const sfxEntries = Object.values(sfxManifest);
+const winsNeeded = 3;
+
+export class BattleScene extends Phaser.Scene {
+  private ui!: DomUi;
+  private keys!: KeyboardBindings;
+  private menuKeys!: MenuKeys;
+  private sim: RoundSimulation | null = null;
+  private ai = new FighterAi(aiDifficulty);
+  private fighterViews = new Map<FighterId, FighterView>();
+  private background!: Phaser.GameObjects.Image;
+  private screen: ScreenState = "title";
+  private hasStarted = false;
+  private stageIndex = 0;
+  private pauseIndex = 0;
+  private roundAdvanceEvent: Phaser.Time.TimerEvent | null = null;
+  private roundEndHandled = false;
+  private selectState: SelectSnapshot = {
+    mode: "pvp",
+    p1Index: 0,
+    p2Index: 1,
+    p1Locked: false,
+    p2Locked: false,
+  };
+  private lastSelection: RoundSelection = {
+    mode: "pvp",
+    p1FighterKey: fighterManifests[0].key,
+    p2FighterKey: fighterManifests[1]?.key ?? fighterManifests[0].key,
+    stageKey: stageManifests[0].key,
+  };
+  private score: MatchScore = { p1: 0, p2: 0 };
+  private voicePolicy: Record<FighterId, VoicePolicy> = {
+    p1: { hurtReadyAtMs: 0, koPlayed: false },
+    p2: { hurtReadyAtMs: 0, koPlayed: false },
+  };
+  private playingVoiceKeys = new Set<string>();
+  private menuMusic: Phaser.Sound.BaseSound | null = null;
+  private specialEffectObjects: Phaser.GameObjects.GameObject[] = [];
+  private specialEffectTimers: Phaser.Time.TimerEvent[] = [];
+  private specialEffectTweens: Phaser.Tweens.Tween[] = [];
+  private specialHtmlAudios: HTMLAudioElement[] = [];
+
+  constructor() {
+    super("BattleScene");
+  }
+
+  preload() {
+    for (const stage of stageManifests) {
+      this.load.image(stage.key, stage.path);
+    }
+
+    for (const portrait of allPortraitAssets()) {
+      this.load.image(portrait.key, portrait.path);
+    }
+
+    for (const pose of allPoseAssets()) {
+      this.loadPoseAsset(pose);
+    }
+
+    for (const specialAsset of allSpecialAssets()) {
+      this.load.image(specialAsset.key, specialAsset.path);
+    }
+
+    for (const [index, path] of allVoicePaths().entries()) {
+      const key = `voice-${index}`;
+      voiceKeyByPath.set(path, key);
+      this.load.audio(key, path);
+    }
+
+    this.load.audio(menuMusicManifest.key, menuMusicManifest.path);
+
+    for (const sfx of sfxEntries) {
+      this.load.audio(sfx.key, sfx.path);
+    }
+  }
+
+  create() {
+    this.ensureFallbackTextures();
+    this.createBackground();
+    this.createFloorMarks();
+    this.keys = createKeyboardBindings(this);
+    this.menuKeys = this.createMenuKeys();
+    this.ui = new DomUi(
+      {
+        chooseMode: (mode) => this.enterCharacterSelect(mode),
+        previewSelection: () => undefined,
+        startMatch: (selection) => this.startMatch(selection, true),
+        pauseAction: (action) => this.applyPauseAction(action),
+        restartMatch: () => this.startMatch(this.lastSelection, true),
+        mainMenu: () => this.enterMainMenu(),
+      },
+      fighterManifests,
+      stageManifests,
+    );
+    this.enterMainMenu();
+  }
+
+  update(_time: number, deltaMs: number) {
+    const clampedDelta = Math.min(deltaMs, 34);
+    this.handleScreenInput();
+
+    if (!this.sim || this.screen !== "playing") {
+      this.ui.updateHud(this.sim?.snapshot ?? null, this.score);
+      return;
+    }
+
+    const inputs =
+      this.sim.snapshot.status === "playing"
+        ? {
+            p1:
+              this.sim.snapshot.specialSequence.phase === "idle"
+                ? readInput(this.keys.p1)
+                : emptyInput(),
+            p2:
+              this.sim.snapshot.specialSequence.phase === "idle"
+                ? this.sim.snapshot.mode === "pvc"
+                  ? this.readAiInput(clampedDelta)
+                  : readInput(this.keys.p2)
+                : emptyInput(),
+          }
+        : {
+            p1: emptyInput(),
+            p2: emptyInput(),
+          };
+
+    this.sim.update(clampedDelta, inputs);
+    this.syncViews(this.sim.snapshot);
+    this.ui.updateHud(this.sim.snapshot, this.score);
+  }
+
+  private enterMainMenu() {
+    this.stopRoundAdvance();
+    this.sim?.cancelSpecialSequence();
+    this.cleanupSpecialEffects();
+    this.resetMatch();
+    this.screen = "title";
+    this.sim = null;
+    this.destroyFighterViews();
+    this.setStage(this.lastSelection.stageKey);
+    this.playMenuMusic();
+    this.ui.showMainMenu();
+    this.ui.updateHud(null, this.score);
+  }
+
+  private enterCharacterSelect(mode: GameMode) {
+    this.stopRoundAdvance();
+    this.sim?.cancelSpecialSequence();
+    this.cleanupSpecialEffects();
+    this.resetMatch();
+    this.screen = "characters";
+    this.sim = null;
+    this.destroyFighterViews();
+    this.playMenuMusic();
+    this.selectState = {
+      mode,
+      p1Index: this.findFighterIndex(this.lastSelection.p1FighterKey, 0),
+      p2Index: this.findFighterIndex(this.lastSelection.p2FighterKey, 1),
+      p1Locked: false,
+      p2Locked: false,
+    };
+    this.ui.showCharacterSelect(this.selectState);
+  }
+
+  private enterStageSelect() {
+    this.sim?.cancelSpecialSequence();
+    this.cleanupSpecialEffects();
+    this.screen = "stage";
+    this.playMenuMusic();
+    this.lastSelection = this.selectionFromSelectState();
+    this.stageIndex = this.findStageIndex(this.lastSelection.stageKey);
+    this.setStage(this.lastSelection.stageKey);
+    this.ui.showStageSelect(this.lastSelection);
+  }
+
+  private startMatch(selection: RoundSelection, resetScore: boolean) {
+    this.hasStarted = true;
+    this.lastSelection = selection;
+    this.stageIndex = this.findStageIndex(selection.stageKey);
+    if (resetScore) {
+      this.resetMatch();
+    }
+    this.startRound();
+  }
+
+  private startRound() {
+    this.stopRoundAdvance();
+    this.sim?.cancelSpecialSequence();
+    this.cleanupSpecialEffects();
+    this.screen = "playing";
+    this.roundEndHandled = false;
+    this.resetVoicePolicy();
+    this.stopMenuMusic();
+    this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+    this.playSfx(sfxManifest.roundStart.key, "roundStart");
+    this.ui.hideRoundMessage();
+    this.ui.hidePauseMenu();
+    this.ui.showGameplay();
+    this.ai.reset();
+    this.destroyFighterViews();
+
+    const p1Def = getFighterManifest(this.lastSelection.p1FighterKey);
+    const p2Def = getFighterManifest(this.lastSelection.p2FighterKey);
+    this.setStage(this.lastSelection.stageKey);
+
+    this.sim = new RoundSimulation(this.lastSelection.mode, p1Def, p2Def, {
+      onAttack: (fighter, attackName) => {
+        this.playSfx(sfxManifest.whoosh.key, "whoosh");
+        this.playAttackVoice(fighter, attackName);
+      },
+      onHit: (_attacker, victim, attackName) => {
+        this.playSfx(
+          attackName === "kick" ? sfxManifest.kickHit.key : sfxManifest.punchHit.key,
+          attackName === "kick" ? "kickHit" : "punchHit",
+        );
+        this.playHurtVoice(victim);
+      },
+      onBlock: () => {
+        this.playSfx(sfxManifest.block.key, "block");
+      },
+      onSpecialStart: (fighter, victim) => {
+        this.playSpecialCastSequence(fighter, victim);
+      },
+      onSpecialHit: (attacker, victim) => {
+        this.playSfx(sfxManifest.kickHit.key, "kickHit");
+        this.playSpecialImpact(attacker, victim);
+        this.playHurtVoice(victim);
+      },
+      onSpecialEnd: () => {
+        this.cleanupSpecialEffects();
+      },
+      onKo: (winner) => {
+        this.playSfx(sfxManifest.ko.key, "ko");
+        if (winner !== "draw") {
+          const loser = winner === "p1" ? this.sim?.snapshot.fighters.p2 : this.sim?.snapshot.fighters.p1;
+          if (loser) {
+            this.playKoVoice(loser);
+          }
+        } else {
+          const fighters = this.sim?.snapshot.fighters;
+          if (fighters) {
+            this.playKoVoice(fighters.p1);
+            this.playKoVoice(fighters.p2);
+          }
+        }
+        this.handleRoundEnd(winner);
+      },
+    });
+
+    this.createFighterView("p1", p1Def);
+    this.createFighterView("p2", p2Def);
+    this.syncViews(this.sim.snapshot);
+    this.ui.updateHud(this.sim.snapshot, this.score);
+  }
+
+  private handleRoundEnd(winner: FighterId | "draw") {
+    if (this.roundEndHandled || !this.sim) {
+      return;
+    }
+
+    this.roundEndHandled = true;
+    this.sim.cancelSpecialSequence();
+    this.cleanupSpecialEffects();
+    if (winner !== "draw") {
+      this.score[winner] += 1;
+    }
+
+    const winnerText =
+      winner === "draw" ? "Draw round" : `${this.sim.snapshot.fighters[winner].def.displayName} wins the round`;
+    this.ui.updateHud(this.sim.snapshot, this.score);
+    this.ui.showRoundMessage(winnerText);
+
+    if (winner !== "draw" && this.score[winner] >= winsNeeded) {
+      this.roundAdvanceEvent = this.time.delayedCall(1600, () => this.showMatchWinner(winner));
+      return;
+    }
+
+    this.roundAdvanceEvent = this.time.delayedCall(2100, () => this.startRound());
+  }
+
+  private showMatchWinner(winner: FighterId) {
+    if (!this.sim) {
+      return;
+    }
+    this.screen = "match-over";
+    this.sim.cancelSpecialSequence();
+    this.cleanupSpecialEffects();
+    this.sound.stopAll();
+    this.ui.hideRoundMessage();
+    this.ui.showMatchWinner(this.sim.snapshot.fighters[winner].def.displayName, this.score);
+  }
+
+  private pauseGame() {
+    if (this.screen !== "playing" || this.sim?.snapshot.status !== "playing") {
+      return;
+    }
+    this.screen = "paused";
+    this.pauseIndex = 0;
+    this.sim.cancelSpecialSequence();
+    this.cleanupSpecialEffects();
+    this.sound.pauseAll();
+    this.tweens.pauseAll();
+    this.time.paused = true;
+    this.ui.showPauseMenu(this.pauseIndex);
+  }
+
+  private resumeGame() {
+    if (this.screen !== "paused") {
+      return;
+    }
+    this.screen = "playing";
+    this.time.paused = false;
+    this.tweens.resumeAll();
+    this.sound.resumeAll();
+    this.ui.hidePauseMenu();
+  }
+
+  private applyPauseAction(action: PauseAction) {
+    if (action === "resume") {
+      this.resumeGame();
+      return;
+    }
+
+    this.sound.stopAll();
+    this.cleanupSpecialEffects();
+    this.time.paused = false;
+    this.tweens.resumeAll();
+    this.ui.hidePauseMenu();
+
+    if (action === "restart-round") {
+      this.startRound();
+    } else if (action === "character-select") {
+      this.enterCharacterSelect(this.lastSelection.mode);
+    } else if (action === "stage-select") {
+      this.resetMatch();
+      this.sim = null;
+      this.destroyFighterViews();
+      this.enterStageSelect();
+    } else if (action === "main-menu") {
+      this.enterMainMenu();
+    }
+  }
+
+  private handleScreenInput() {
+    if (this.screen === "title") {
+      if (this.just(this.keys.p1.punch)) {
+        this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+        this.enterCharacterSelect("pvp");
+      } else if (this.just(this.keys.p2.punch)) {
+        this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+        this.enterCharacterSelect("pvc");
+      }
+      return;
+    }
+
+    if (this.screen === "characters") {
+      this.handleCharacterSelectInput();
+      return;
+    }
+
+    if (this.screen === "stage") {
+      this.handleStageSelectInput();
+      return;
+    }
+
+    if (this.screen === "playing") {
+      if (this.just(this.menuKeys.escape) || this.just(this.menuKeys.enter)) {
+        this.pauseGame();
+      }
+      return;
+    }
+
+    if (this.screen === "paused") {
+      this.handlePauseInput();
+      return;
+    }
+
+    if (this.screen === "match-over") {
+      if (this.just(this.keys.p1.punch) || this.just(this.menuKeys.enter) || this.just(this.menuKeys.space)) {
+        this.startMatch(this.lastSelection, true);
+      } else if (this.just(this.keys.p1.kick) || this.just(this.menuKeys.escape)) {
+        this.enterMainMenu();
+      }
+    }
+  }
+
+  private handleCharacterSelectInput() {
+    let changed = false;
+    if (!this.selectState.p1Locked) {
+      const delta = this.cursorDelta("p1");
+      if (delta !== 0) {
+        this.selectState.p1Index = this.wrapFighterIndex(this.selectState.p1Index + delta);
+        changed = true;
+      }
+    }
+
+    if (!this.selectState.p2Locked) {
+      const delta = this.cursorDelta("p2");
+      if (delta !== 0) {
+        this.selectState.p2Index = this.wrapFighterIndex(this.selectState.p2Index + delta);
+        changed = true;
+      }
+    }
+
+    if (this.just(this.keys.p1.punch)) {
+      this.selectState.p1Locked = true;
+      if (this.selectState.mode === "pvc") {
+        this.selectState.p2Index = this.randomCpuFighterIndex(this.selectState.p1Index);
+        this.selectState.p2Locked = true;
+      }
+      this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+      changed = true;
+    }
+    if (this.just(this.keys.p2.punch)) {
+      this.selectState.p2Locked = true;
+      this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+      changed = true;
+    }
+    if (this.just(this.keys.p1.kick)) {
+      this.selectState.p1Locked = false;
+      changed = true;
+    }
+    if (this.just(this.keys.p2.kick)) {
+      this.selectState.p2Locked = false;
+      changed = true;
+    }
+
+    if (
+      this.just(this.menuKeys.enter) ||
+      (this.selectState.p1Locked && this.selectState.p2Locked && (this.just(this.keys.p1.punch) || this.just(this.keys.p2.punch)))
+    ) {
+      if (this.selectState.mode === "pvc" && this.selectState.p1Locked && !this.selectState.p2Locked) {
+        this.selectState.p2Locked = true;
+      }
+      if (this.selectState.p1Locked && this.selectState.p2Locked) {
+        this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+        this.enterStageSelect();
+        return;
+      }
+    }
+
+    if (this.just(this.menuKeys.escape)) {
+      this.enterMainMenu();
+      return;
+    }
+
+    if (changed) {
+      this.ui.updateCharacterSelect(this.selectState);
+    }
+  }
+
+  private handleStageSelectInput() {
+    let delta = 0;
+    if (this.just(this.keys.p1.left) || this.just(this.keys.p2.left)) delta -= 1;
+    if (this.just(this.keys.p1.right) || this.just(this.keys.p2.right)) delta += 1;
+
+    if (delta !== 0) {
+      this.stageIndex = Phaser.Math.Wrap(this.stageIndex + delta, 0, stageManifests.length);
+      this.lastSelection.stageKey = stageManifests[this.stageIndex].key;
+      this.setStage(this.lastSelection.stageKey);
+      this.ui.updateStageSelect(this.stageIndex);
+    }
+
+    if (
+      this.just(this.keys.p1.punch) ||
+      this.just(this.keys.p2.punch) ||
+      this.just(this.menuKeys.enter) ||
+      this.just(this.menuKeys.space)
+    ) {
+      this.lastSelection.stageKey = stageManifests[this.stageIndex].key;
+      this.startMatch(this.lastSelection, true);
+    } else if (this.just(this.keys.p1.kick) || this.just(this.keys.p2.kick) || this.just(this.menuKeys.escape)) {
+      this.enterCharacterSelect(this.lastSelection.mode);
+    }
+  }
+
+  private handlePauseInput() {
+    if (this.just(this.menuKeys.p1Up) || this.just(this.menuKeys.p2Up)) {
+      this.pauseIndex -= 1;
+      this.ui.updatePauseMenu(this.pauseIndex);
+    }
+    if (this.just(this.menuKeys.p1Down) || this.just(this.menuKeys.p2Down)) {
+      this.pauseIndex += 1;
+      this.ui.updatePauseMenu(this.pauseIndex);
+    }
+
+    if (
+      this.just(this.keys.p1.punch) ||
+      this.just(this.keys.p2.punch) ||
+      this.just(this.menuKeys.enter) ||
+      this.just(this.menuKeys.space)
+    ) {
+      this.applyPauseAction(this.ui.getPauseAction(this.pauseIndex));
+    } else if (this.just(this.keys.p1.kick) || this.just(this.keys.p2.kick) || this.just(this.menuKeys.escape)) {
+      this.resumeGame();
+    }
+  }
+
+  private readAiInput(deltaMs: number) {
+    if (!this.sim) {
+      return emptyInput();
+    }
+    return this.ai.decide(deltaMs, this.sim.snapshot.fighters.p2, this.sim.snapshot.fighters.p1);
+  }
+
+  private cursorDelta(player: "p1" | "p2") {
+    const keys = player === "p1" ? this.keys.p1 : this.keys.p2;
+    const up = player === "p1" ? this.menuKeys.p1Up : this.menuKeys.p2Up;
+    const down = player === "p1" ? this.menuKeys.p1Down : this.menuKeys.p2Down;
+    let delta = 0;
+    if (this.just(keys.left) || this.just(up)) delta -= 1;
+    if (this.just(keys.right) || this.just(down)) delta += 1;
+    return delta;
+  }
+
+  private selectionFromSelectState(): RoundSelection {
+    return {
+      mode: this.selectState.mode,
+      p1FighterKey: fighterManifests[this.selectState.p1Index]?.key ?? fighterManifests[0].key,
+      p2FighterKey: fighterManifests[this.selectState.p2Index]?.key ?? fighterManifests[0].key,
+      stageKey: this.lastSelection.stageKey,
+    };
+  }
+
+  private resetMatch() {
+    this.score = { p1: 0, p2: 0 };
+    this.roundEndHandled = false;
+    this.stopRoundAdvance();
+  }
+
+  private stopRoundAdvance() {
+    this.roundAdvanceEvent?.remove(false);
+    this.roundAdvanceEvent = null;
+  }
+
+  private createMenuKeys(): MenuKeys {
+    const keyboard = this.input.keyboard;
+    if (!keyboard) {
+      throw new Error("Keyboard input is not available in this browser.");
+    }
+    return {
+      enter: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.ENTER),
+      escape: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.ESC),
+      space: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE),
+      p1Up: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.W),
+      p1Down: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.S),
+      p2Up: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.UP),
+      p2Down: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.DOWN),
+      p1Back: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.G),
+      p2Back: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.L),
+    };
+  }
+
+  private loadPoseAsset(pose: PoseAsset) {
+    if (pose.type === "spritesheet") {
+      this.load.spritesheet(pose.key, pose.path, {
+        frameWidth: pose.frameWidth,
+        frameHeight: pose.frameHeight,
+      });
+    } else {
+      this.load.image(pose.key, pose.path);
+    }
+  }
+
+  private ensureFallbackTextures() {
+    this.createFallbackTexture("missing-stage", 960, 540, 0x1f2933, "BSU STAGE");
+
+    for (const fighter of fighterManifests) {
+      if (!this.textures.exists(fighter.portrait.key)) {
+        const idle = fighter.poses.idle;
+        if (this.textures.exists(idle.key)) {
+          this.textures.addCanvas(fighter.portrait.key, this.textures.get(idle.key).getSourceImage() as HTMLCanvasElement);
+        } else {
+          this.createFallbackTexture(fighter.portrait.key, 256, 256, 0x2c3440, fighter.displayName);
+        }
+      }
+
+      for (const pose of Object.values(fighter.poses)) {
+        if (!this.textures.exists(pose.key)) {
+          this.createFallbackTexture(pose.key, 256, 256, fighter.key === "esleigue" ? 0x167d77 : 0x9f3f38, fighter.displayName);
+        }
+        if (pose.type === "spritesheet") {
+          for (const [animKey, config] of Object.entries(pose.animations)) {
+            const fullKey = `${pose.key}-${animKey}`;
+            if (!this.anims.exists(fullKey)) {
+              this.anims.create({
+                key: fullKey,
+                frames: this.anims.generateFrameNumbers(pose.key, { start: config.start, end: config.end }),
+                frameRate: config.frameRate,
+                repeat: config.repeat,
+              });
+            }
+          }
+        }
+      }
+
+      if (!this.textures.exists(fighter.special.asset.key)) {
+        this.createSpecialFallbackTexture(fighter.special.asset.key, fighter.special.effect, fighter.displayName);
+      }
+    }
+  }
+
+  private createFallbackTexture(key: string, width: number, height: number, label: string | number, text: string) {
+    const graphics = this.make.graphics({ x: 0, y: 0 }, false);
+    const color = typeof label === "number" ? label : 0x2c3440;
+    graphics.fillStyle(color, 1);
+    graphics.fillRect(0, 0, width, height);
+    graphics.lineStyle(8, 0xffffff, 0.75);
+    graphics.strokeRect(4, 4, width - 8, height - 8);
+    graphics.generateTexture(key, width, height);
+    graphics.destroy();
+  }
+
+  private createSpecialFallbackTexture(key: string, effect: SpecialEffectKind, label: string) {
+    const graphics = this.make.graphics({ x: 0, y: 0 }, false);
+    graphics.fillStyle(effect === "car-rush" ? 0x050505 : effect === "rasengan" ? 0x1c82ff : 0x2c3440, 1);
+    graphics.fillRoundedRect(0, 38, 220, 88, 18);
+    graphics.fillStyle(0xffffff, 0.9);
+    graphics.fillRoundedRect(38, 16, 88, 46, 12);
+    graphics.fillStyle(effect === "rasengan" ? 0x8deeff : 0xf4c84a, 1);
+    graphics.fillCircle(180, 82, 28);
+    graphics.lineStyle(8, 0xffffff, 0.72);
+    graphics.strokeRoundedRect(4, 4, 212, 132, 16);
+    graphics.generateTexture(key, 220, 140);
+    graphics.destroy();
+  }
+
+  private createBackground() {
+    const stage = getStageManifest(this.lastSelection.stageKey);
+    const bgKey = this.textures.exists(stage.key) ? stage.key : "missing-stage";
+    this.background = this.add.image(480, 270, bgKey);
+    this.background.setDisplaySize(960, 540);
+    this.background.setDepth(-10);
+  }
+
+  private setStage(stageKey: string) {
+    this.cleanupSpecialEffects();
+    const stage = getStageManifest(stageKey);
+    const textureKey = this.textures.exists(stage.key) ? stage.key : "missing-stage";
+    this.background?.setTexture(textureKey);
+    this.background?.setDisplaySize(960, 540);
+  }
+
+  private createFloorMarks() {
+    const ground = this.add.rectangle(480, 493, 840, 5, 0xf4c84a, 0.72);
+    ground.setDepth(-1);
+    this.add.rectangle(480, 510, 960, 60, 0x06080c, 0.28).setDepth(-2);
+  }
+
+  private destroyFighterViews() {
+    const staleViews: Phaser.GameObjects.GameObject[] = [];
+    this.children.each((child) => {
+      if (child.getData("fighterView")) {
+        staleViews.push(child);
+      }
+    });
+    for (const view of staleViews) {
+      view.destroy();
+    }
+    this.fighterViews.clear();
+  }
+
+  private createFighterView(
+    id: FighterId,
+    def: FighterAssetManifest,
+    x = 0,
+    y = 0,
+    facing: -1 | 1 = 1,
+  ) {
+    const pose = def.poses.idle;
+    const shadow = this.add.ellipse(x, y + 8, def.body.drawWidth * 0.62, 28, 0x000000, 0.34);
+    const sprite = this.add.sprite(x, y, pose.key);
+    sprite.setOrigin(0.5, 1);
+    sprite.setDisplaySize(def.body.drawWidth * def.scale, def.body.drawHeight * def.scale);
+    sprite.setFlipX(this.shouldFlip(def, "idle", facing));
+    sprite.setData("fighterView", true);
+    shadow.setData("fighterView", true);
+    shadow.setDepth(2);
+    sprite.setDepth(3);
+    this.fighterViews.set(id, {
+      sprite,
+      shadow,
+      lastPose: null,
+      effect: { offsetX: 0, offsetY: 0, angle: 0, scale: 1 },
+    });
+  }
+
+  private syncViews(snapshot: RoundSnapshot) {
+    const specialSequence = snapshot.specialSequence;
+    for (const fighter of Object.values(snapshot.fighters)) {
+      const view = this.fighterViews.get(fighter.id);
+      if (!view) {
+        continue;
+      }
+      view.sprite.setPosition(fighter.x + view.effect.offsetX, fighter.y + view.effect.offsetY);
+      view.sprite.setAngle(view.effect.angle);
+      view.sprite.setFlipX(this.shouldFlip(fighter.def, fighter.pose, fighter.facing));
+      view.sprite.setDisplaySize(
+        fighter.def.body.drawWidth * fighter.def.scale * view.effect.scale,
+        fighter.def.body.drawHeight * fighter.def.scale * view.effect.scale,
+      );
+      view.shadow.setPosition(fighter.x, 472);
+      view.shadow.setScale(fighter.grounded ? 1 : 0.74);
+
+      if (view.lastPose !== fighter.pose) {
+        this.applyPose(view.sprite, fighter.def, fighter.pose);
+        view.lastPose = fighter.pose;
+      }
+
+      if (specialSequence.phase === "intro" && specialSequence.casterId === fighter.id) {
+        view.sprite.setTint(0xfff1a6);
+      } else if (fighter.hitStunMs > 0) {
+        view.sprite.setTint(0xffb2a8);
+      } else if (fighter.health <= 0) {
+        view.sprite.setTint(0x9a9a9a);
+      } else {
+        view.sprite.clearTint();
+      }
+    }
+  }
+
+  private applyPose(sprite: Phaser.GameObjects.Sprite, def: FighterAssetManifest, poseName: PoseName) {
+    const pose = def.poses[poseName];
+    if (pose.type === "spritesheet") {
+      const animationKey = `${pose.key}-${poseName}`;
+      if (this.anims.exists(animationKey)) {
+        sprite.play(animationKey, true);
+        return;
+      }
+    }
+    sprite.stop();
+    sprite.setTexture(pose.key);
+  }
+
+  private shouldFlip(def: FighterAssetManifest, poseName: PoseName, facing: -1 | 1) {
+    return shouldFlipFighterAsset(def, poseName, facing);
+  }
+
+  private playMenuMusic() {
+    if (!this.cache.audio.exists(menuMusicManifest.key)) {
+      return;
+    }
+    if (!this.menuMusic) {
+      this.menuMusic = this.sound.add(menuMusicManifest.key, {
+        loop: true,
+        volume: audioConfig.musicVolume,
+      });
+    }
+    if (!this.menuMusic.isPlaying) {
+      this.menuMusic.play({ loop: true, volume: audioConfig.musicVolume });
+    }
+  }
+
+  private stopMenuMusic() {
+    if (this.menuMusic?.isPlaying) {
+      this.menuMusic.stop();
+    }
+  }
+
+  private trackSpecialObject<T extends Phaser.GameObjects.GameObject>(object: T): T {
+    object.setData("specialEffect", true);
+    this.specialEffectObjects.push(object);
+    return object;
+  }
+
+  private trackSpecialTween(tween: Phaser.Tweens.Tween) {
+    this.specialEffectTweens.push(tween);
+    return tween;
+  }
+
+  private trackSpecialTimer(timer: Phaser.Time.TimerEvent) {
+    this.specialEffectTimers.push(timer);
+    return timer;
+  }
+
+  private cleanupSpecialEffects() {
+    for (const timer of this.specialEffectTimers) {
+      timer.remove(false);
+    }
+    this.specialEffectTimers = [];
+
+    for (const tween of this.specialEffectTweens) {
+      tween.stop();
+      tween.remove();
+    }
+    this.specialEffectTweens = [];
+
+    const taggedObjects: Phaser.GameObjects.GameObject[] = [];
+    this.children.each((child) => {
+      if (child.getData("specialEffect")) {
+        taggedObjects.push(child);
+      }
+    });
+    for (const object of [...this.specialEffectObjects, ...taggedObjects]) {
+      if (object.active) {
+        object.destroy();
+      }
+    }
+    this.specialEffectObjects = [];
+
+    this.cameras.main.resetFX();
+    this.cameras.main.setZoom(1);
+    this.cameras.main.centerOn(480, 270);
+    for (const view of this.fighterViews.values()) {
+      view.effect.offsetX = 0;
+      view.effect.offsetY = 0;
+      view.effect.angle = 0;
+      view.effect.scale = 1;
+      view.sprite.setAlpha(1);
+      view.sprite.clearTint();
+      view.sprite.setDepth(3);
+      view.shadow.setDepth(2);
+    }
+    for (const audio of this.specialHtmlAudios) {
+      audio.pause();
+      audio.src = "";
+      audio.remove();
+    }
+    this.specialHtmlAudios = [];
+  }
+
+  private playSpecialCastSequence(attacker: FighterState, victim: FighterState) {
+    this.cleanupSpecialEffects();
+    this.playOptionalIdjaoSpecialAudio(attacker, "special");
+    this.playSpecialVoice(attacker);
+    this.playSfx(sfxManifest.roundStart.key, "roundStart");
+
+    const overlay = this.trackSpecialObject(this.add.rectangle(480, 270, 960, 540, 0x000000, 0.54));
+    overlay.setDepth(5);
+
+    const special = attacker.def.special;
+    const label = this.trackSpecialObject(
+      this.add
+        .text(480, 130, special.name, {
+          color: "#fff2a4",
+          fontFamily: "Arial",
+          fontSize: "44px",
+          fontStyle: "900",
+          stroke: "#000000",
+          strokeThickness: 7,
+        })
+        .setOrigin(0.5)
+        .setDepth(13),
+    );
+
+    const casterView = this.fighterViews.get(attacker.id);
+    if (casterView) {
+      casterView.sprite.setDepth(14);
+      casterView.sprite.setTint(0xfff1a6);
+      this.trackSpecialTween(
+        this.tweens.add({
+          targets: casterView.effect,
+          offsetY: -16,
+          scale: 1.22,
+          duration: SPECIAL_INTRO_PAUSE_MS,
+          ease: "Sine.easeInOut",
+          yoyo: true,
+        }),
+      );
+    }
+
+    this.trackSpecialTween(
+      this.tweens.add({
+        targets: label,
+        scaleX: 1.08,
+        scaleY: 1.08,
+        alpha: 0.92,
+        duration: 180,
+        yoyo: true,
+        repeat: 2,
+      }),
+    );
+
+    this.trackSpecialTimer(
+      this.time.delayedCall(SPECIAL_NAME_DISPLAY_MS, () => {
+        label.destroy();
+      }),
+    );
+
+    this.trackSpecialTimer(
+      this.time.delayedCall(SPECIAL_INTRO_PAUSE_MS, () => {
+        if (casterView) {
+          casterView.sprite.setDepth(3);
+          casterView.sprite.clearTint();
+        }
+        this.playSfx(sfxManifest.whoosh.key, "whoosh");
+        this.playSpecialEffect(attacker, victim);
+      }),
+    );
+
+    this.trackSpecialTimer(
+      this.time.delayedCall(SPECIAL_INTRO_PAUSE_MS + this.getSpecialSceneDurationMs(attacker), () => {
+        overlay.destroy();
+      }),
+    );
+  }
+
+  private getSpecialSceneDurationMs(attacker: FighterState) {
+    return (
+      attacker.def.special.durationMs +
+      (attacker.def.special.impactHoldMs ?? 180) +
+      (attacker.def.special.recoveryMs ?? SPECIAL_RECOVERY_MS)
+    );
+  }
+
+  private playSpecialEffect(attacker: FighterState, victim: FighterState) {
+    const special = attacker.def.special;
+    if (this.hasSpecialFrameSequence(attacker)) {
+      this.playSpecialFrameSequenceEffect(attacker, victim);
+    } else if (special.effect === "super-flight") {
+      this.playSuperFlightEffect(attacker, victim);
+    } else if (special.effect === "ground-smash") {
+      this.playGroundSmashEffect(attacker, victim);
+    } else if (special.effect === "car-rush") {
+      this.playCarRushEffect(attacker);
+    } else if (special.effect === "fishing-trap") {
+      this.playFishingTrapEffect(attacker, victim);
+    } else if (special.effect === "barbell") {
+      this.playBarbellEffect(attacker, victim);
+    } else {
+      this.playRasenganEffect(attacker, victim);
+    }
+  }
+
+  private playSuperFlightEffect(attacker: FighterState, victim: FighterState) {
+    const sprite = this.createSpecialSprite(attacker, 220, 150);
+    sprite.setPosition(attacker.x, attacker.y - 120);
+    this.trackSpecialTween(this.tweens.add({
+      targets: sprite,
+      x: victim.x - attacker.facing * 34,
+      y: victim.y - 126,
+      scaleX: 1.16,
+      scaleY: 1.16,
+      duration: 760,
+      ease: "Back.easeIn",
+      yoyo: true,
+      hold: 80,
+      onComplete: () => sprite.destroy(),
+    }));
+    this.tweenFighterOffset(attacker.id, attacker.facing * 70, -52, 0, 1.08, 760, true);
+  }
+
+  private playGroundSmashEffect(attacker: FighterState, victim: FighterState) {
+    const sprite = this.createSpecialSprite(attacker, 250, 190);
+    sprite.setPosition(attacker.x, attacker.y);
+    this.tweenFighterOffset(attacker.id, 0, -8, -6 * attacker.facing, 1.28, 360, true);
+    this.trackSpecialTimer(this.time.delayedCall(760, () => {
+      this.cameras.main.shake(260, 0.012);
+      this.tweenFighterOffset(victim.id, -attacker.facing * 58, -62, 13 * attacker.facing, 1, 300, true);
+    }));
+    this.trackSpecialTween(this.tweens.add({
+      targets: sprite,
+      alpha: 0,
+      scaleX: 1.32,
+      scaleY: 1.12,
+      duration: 1180,
+      onComplete: () => sprite.destroy(),
+    }));
+  }
+
+  private playCarRushEffect(attacker: FighterState) {
+    const sprite = this.createSpecialSprite(attacker, 260, 150);
+    const startX = attacker.facing === 1 ? -150 : 1110;
+    const endX = attacker.facing === 1 ? 1110 : -150;
+    sprite.setPosition(startX, 420);
+    this.trackSpecialTween(this.tweens.add({
+      targets: sprite,
+      x: endX,
+      duration: 1320,
+      ease: "Cubic.easeIn",
+      onComplete: () => sprite.destroy(),
+    }));
+  }
+
+  private hasSpecialFrameSequence(attacker: FighterState) {
+    const frames = attacker.def.special.frameAssets ?? [];
+    return frames.length === 5 && frames.every((frame) => this.textures.exists(frame.key));
+  }
+
+  private playSpecialFrameSequenceEffect(attacker: FighterState, victim: FighterState) {
+    const frames = attacker.def.special.frameAssets ?? [];
+    const frameDurations = this.getSpecialFrameDurations(attacker);
+    const isCarRush = attacker.def.special.effect === "car-rush";
+    const startX = isCarRush ? (attacker.facing === 1 ? -170 : 1130) : attacker.x + attacker.facing * 24;
+    const endX = isCarRush
+      ? (attacker.facing === 1 ? 1130 : -170)
+      : Phaser.Math.Clamp(victim.x - attacker.facing * 36, 80, 880);
+    const y = isCarRush ? 414 : attacker.y;
+    const width = isCarRush ? 300 : Math.max(attacker.def.body.drawWidth * 1.28, 270);
+    const height = isCarRush ? 300 : Math.max(attacker.def.body.drawHeight * 1.22, 260);
+    const sprite = this.trackSpecialObject(this.add.sprite(startX, y, frames[0].key));
+    sprite.setOrigin(0.5, 1);
+    sprite.setDisplaySize(width, height);
+    sprite.setDepth(9);
+    sprite.setFlipX(shouldFlipSpecialFrameAsset(attacker.def, 0, attacker.facing));
+
+    const casterView = this.fighterViews.get(attacker.id);
+    if (casterView) {
+      casterView.sprite.setAlpha(0);
+    }
+
+    let elapsedMs = 0;
+    for (const [index, frame] of frames.entries()) {
+      const frameStartMs = elapsedMs;
+      this.trackSpecialTimer(
+        this.time.delayedCall(frameStartMs, () => {
+          if (!sprite.active) {
+            return;
+          }
+          sprite.setTexture(frame.key);
+          sprite.setFlipX(shouldFlipSpecialFrameAsset(attacker.def, index, attacker.facing));
+          if (index === (attacker.def.special.impactFrame ?? 4) - 1) {
+            if (attacker.def.special.effect === "ground-smash" || attacker.def.special.effect === "barbell") {
+              this.cameras.main.shake(260, 0.012);
+            } else {
+              this.cameras.main.shake(180, 0.008);
+            }
+          }
+        }),
+      );
+      elapsedMs += frameDurations[index] ?? SPECIAL_FRAME_MS;
+    }
+
+    this.trackSpecialTween(
+      this.tweens.add({
+        targets: sprite,
+        x: endX,
+        duration: elapsedMs,
+        ease: "Sine.easeInOut",
+        onComplete: () => {
+          sprite.destroy();
+          if (casterView) {
+            casterView.sprite.setAlpha(1);
+            casterView.sprite.clearTint();
+          }
+        },
+      }),
+    );
+  }
+
+  private getSpecialFrameDurations(attacker: FighterState) {
+    const frames = attacker.def.special.frameAssets ?? [];
+    const configured = attacker.def.special.frameDurationsMs ?? [];
+    return frames.map((_frame, index) => configured[index] ?? SPECIAL_FRAME_MS);
+  }
+
+  private playFishingTrapEffect(attacker: FighterState, victim: FighterState) {
+    const graphics = this.trackSpecialObject(this.add.graphics().setDepth(8));
+    const updateLine = () => {
+      graphics.clear();
+      graphics.lineStyle(5, 0xf4c84a, 0.9);
+      graphics.beginPath();
+      graphics.moveTo(attacker.x, attacker.y - 118);
+      graphics.lineTo(victim.x, victim.y - 105);
+      graphics.strokePath();
+      graphics.fillStyle(0xffffff, 0.95);
+      graphics.fillCircle(victim.x, victim.y - 105, 8);
+    };
+    const timer = this.trackSpecialTimer(this.time.addEvent({ delay: 1000 / SPECIAL_ANIMATION_FRAME_RATE, repeat: 54, callback: updateLine }));
+    this.tweenFighterOffset(victim.id, -attacker.facing * 72, -18, -8 * attacker.facing, 1, 620, true);
+    this.trackSpecialTimer(this.time.delayedCall(1120, () => {
+      timer.remove(false);
+      graphics.destroy();
+    }));
+  }
+
+  private playBarbellEffect(attacker: FighterState, victim: FighterState) {
+    const sprite = this.createSpecialSprite(attacker, 230, 160);
+    sprite.setPosition(attacker.x + attacker.facing * 88, attacker.y - 108);
+    sprite.setAngle(-35 * attacker.facing);
+    this.trackSpecialTween(this.tweens.add({
+      targets: sprite,
+      angle: 85 * attacker.facing,
+      x: victim.x,
+      y: victim.y - 98,
+      duration: 980,
+      ease: "Back.easeIn",
+      onComplete: () => {
+        this.cameras.main.shake(220, 0.01);
+        sprite.destroy();
+      },
+    }));
+  }
+
+  private playRasenganEffect(attacker: FighterState, victim: FighterState) {
+    const graphics = this.trackSpecialObject(this.add.graphics().setDepth(9));
+    const ball = { x: attacker.x + attacker.facing * 48, y: attacker.y - 116, radius: 18, spin: 0 };
+    const redraw = () => {
+      graphics.clear();
+      graphics.fillStyle(0x2d9cff, 0.82);
+      graphics.fillCircle(ball.x, ball.y, ball.radius);
+      graphics.lineStyle(4, 0xb7f8ff, 0.9);
+      for (let i = 0; i < 3; i += 1) {
+        graphics.strokeCircle(ball.x + Math.cos(ball.spin + i * 2) * 7, ball.y + Math.sin(ball.spin + i * 2) * 5, ball.radius - i * 4);
+      }
+      ball.spin += 0.42;
+    };
+    const timer = this.trackSpecialTimer(this.time.addEvent({ delay: 1000 / SPECIAL_ANIMATION_FRAME_RATE, repeat: 54, callback: redraw }));
+    this.trackSpecialTween(this.tweens.add({
+      targets: ball,
+      x: victim.x - attacker.facing * 24,
+      radius: 34,
+      duration: 860,
+      ease: "Cubic.easeIn",
+      onComplete: () => {
+        this.cameras.main.shake(180, 0.008);
+      },
+    }));
+    this.trackSpecialTimer(this.time.delayedCall(1020, () => {
+      timer.remove(false);
+      graphics.destroy();
+    }));
+  }
+
+  private createSpecialSprite(attacker: FighterState, width: number, height: number) {
+    const special = attacker.def.special;
+    const sprite = this.trackSpecialObject(this.add.sprite(attacker.x, attacker.y, special.asset.key));
+    sprite.setOrigin(0.5, 1);
+    sprite.setDisplaySize(width, height);
+    sprite.setDepth(7);
+    sprite.setFlipX(shouldFlipSpecialAsset(attacker.def, attacker.facing));
+    return sprite;
+  }
+
+  private tweenFighterOffset(
+    fighterId: FighterId,
+    offsetX: number,
+    offsetY: number,
+    angle: number,
+    scale: number,
+    duration: number,
+    yoyo: boolean,
+  ) {
+    const view = this.fighterViews.get(fighterId);
+    if (!view) {
+      return;
+    }
+    this.trackSpecialTween(this.tweens.add({
+      targets: view.effect,
+      offsetX,
+      offsetY,
+      angle,
+      scale,
+      duration,
+      ease: "Quad.easeOut",
+      yoyo,
+      onComplete: () => {
+        view.effect.offsetX = 0;
+        view.effect.offsetY = 0;
+        view.effect.angle = 0;
+        view.effect.scale = 1;
+      },
+    }));
+  }
+
+  private playSpecialImpact(attacker: FighterState, victim: FighterState) {
+    this.playOptionalIdjaoSpecialAudio(attacker, "special_hit");
+    if (attacker.def.special.effect === "ground-smash" || attacker.def.special.effect === "barbell") {
+      this.cameras.main.shake(240, 0.012);
+    }
+    if (attacker.def.special.effect === "fishing-trap") {
+      this.tweenFighterOffset(victim.id, -attacker.facing * 42, -12, 0, 1, 180, true);
+    }
+    if (attacker.def.special.effect === "rasengan") {
+      this.cameras.main.flash(130, 70, 180, 255);
+    }
+  }
+
+  private playOptionalIdjaoSpecialAudio(attacker: FighterState, fileName: "special" | "special_hit") {
+    if (attacker.def.key !== "idjao") {
+      return;
+    }
+    const audio = new Audio(`/assets/fighters/idjao/special_idjao/${fileName}.mp3`);
+    audio.volume = audioConfig.sfxVolume;
+    this.specialHtmlAudios.push(audio);
+    audio.play().catch(() => {
+      audio.remove();
+    });
+    audio.addEventListener("ended", () => {
+      audio.remove();
+    });
+    audio.addEventListener("error", () => {
+      audio.remove();
+    });
+  }
+
+  private resetVoicePolicy() {
+    this.voicePolicy = {
+      p1: { hurtReadyAtMs: 0, koPlayed: false },
+      p2: { hurtReadyAtMs: 0, koPlayed: false },
+    };
+    this.playingVoiceKeys.clear();
+  }
+
+  private playAttackVoice(fighter: FighterState, _attackName: string) {
+    if (
+      this.screen === "paused" ||
+      fighter.health <= 0 ||
+      this.sim?.snapshot.specialSequence.phase !== "idle" ||
+      this.voicePolicy[fighter.id].koPlayed
+    ) {
+      return;
+    }
+    this.playRandomVoice(fighter.def.voices.attack);
+  }
+
+  private playSpecialVoice(fighter: FighterState) {
+    if (this.screen === "paused" || fighter.health <= 0 || this.voicePolicy[fighter.id].koPlayed) {
+      return;
+    }
+    this.playRandomVoice(fighter.def.voices.special);
+  }
+
+  private playHurtVoice(fighter: FighterState) {
+    const policy = this.voicePolicy[fighter.id];
+    const now = this.time.now;
+    if (this.screen === "paused" || fighter.health <= 0 || policy.koPlayed || now < policy.hurtReadyAtMs) {
+      return;
+    }
+    policy.hurtReadyAtMs = now + 800;
+    this.playRandomVoice(fighter.def.voices.hurt);
+  }
+
+  private playKoVoice(fighter: FighterState) {
+    const policy = this.voicePolicy[fighter.id];
+    if (policy.koPlayed) {
+      return;
+    }
+    policy.koPlayed = true;
+    this.playRandomVoice(fighter.def.voices.ko);
+  }
+
+  private playRandomVoice(paths: string[]) {
+    if (paths.length === 0) {
+      return;
+    }
+    const path = Phaser.Utils.Array.GetRandom(paths);
+    const key = voiceKeyByPath.get(path);
+    if (!key || !this.cache.audio.exists(key) || this.playingVoiceKeys.has(key)) {
+      return;
+    }
+    try {
+      const sound = this.sound.add(key, { volume: audioConfig.voiceVolume });
+      this.playingVoiceKeys.add(key);
+      sound.once("complete", () => {
+        this.playingVoiceKeys.delete(key);
+        sound.destroy();
+      });
+      sound.once("destroy", () => {
+        this.playingVoiceKeys.delete(key);
+      });
+      sound.play();
+    } catch {
+      this.playingVoiceKeys.delete(key);
+    }
+  }
+
+  private playSfx(key: string, fallbackName: keyof typeof sfxManifest | string) {
+    if (this.screen === "paused") {
+      return;
+    }
+    if (this.cache.audio.exists(key)) {
+      try {
+        this.sound.play(key, { volume: audioConfig.sfxVolume });
+        return;
+      } catch {
+        // Fall through to synthesized Web Audio when browser playback is blocked or decoding fails.
+      }
+    }
+    this.playSynthFallback(fallbackName);
+  }
+
+  private playSynthFallback(name: string) {
+    const browserWindow = window as WindowWithWebkitAudio;
+    const AudioContextClass = browserWindow.AudioContext || browserWindow.webkitAudioContext;
+    if (!AudioContextClass) {
+      return;
+    }
+    const ctx = new AudioContextClass();
+    const now = ctx.currentTime;
+    const gain = ctx.createGain();
+    gain.connect(ctx.destination);
+    gain.gain.setValueAtTime(0.0001, now);
+    const oscillator = ctx.createOscillator();
+    oscillator.connect(gain);
+    const duration = name === "ko" ? 0.62 : name === "roundStart" ? 0.46 : name === "whoosh" ? 0.22 : 0.18;
+    const startFreq = name === "kickHit" ? 92 : name === "punchHit" ? 118 : name === "block" ? 520 : name === "ko" ? 420 : 720;
+    const endFreq = name === "whoosh" ? 1440 : name === "ko" ? 72 : name === "roundStart" ? 220 : startFreq * 0.72;
+    oscillator.type = name === "block" || name === "menuSelect" ? "square" : "sawtooth";
+    oscillator.frequency.setValueAtTime(startFreq, now);
+    oscillator.frequency.exponentialRampToValueAtTime(Math.max(30, endFreq), now + duration);
+    gain.gain.exponentialRampToValueAtTime(0.42, now + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+    oscillator.start(now);
+    oscillator.stop(now + duration);
+    oscillator.addEventListener("ended", () => {
+      void ctx.close();
+    });
+  }
+
+  private findFighterIndex(key: string, fallback: number) {
+    const index = fighterManifests.findIndex((fighter) => fighter.key === key);
+    return index >= 0 ? index : Math.min(fallback, fighterManifests.length - 1);
+  }
+
+  private findStageIndex(key: string) {
+    const index = stageManifests.findIndex((stage) => stage.key === key);
+    return index >= 0 ? index : 0;
+  }
+
+  private wrapFighterIndex(index: number) {
+    return Phaser.Math.Wrap(index, 0, fighterManifests.length);
+  }
+
+  private randomCpuFighterIndex(excludedIndex: number) {
+    if (fighterManifests.length <= 1) {
+      return 0;
+    }
+    const options = fighterManifests
+      .map((_fighter, index) => index)
+      .filter((index) => index !== excludedIndex);
+    return Phaser.Utils.Array.GetRandom(options);
+  }
+
+  private just(key: Phaser.Input.Keyboard.Key) {
+    return Phaser.Input.Keyboard.JustDown(key);
+  }
+}

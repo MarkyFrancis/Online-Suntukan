@@ -1,0 +1,21 @@
+{
+  "name": "bsu-online-suntukan",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc && vite build",
+    "generate:sfx": "node scripts/generate-sfx.mjs",
+    "smoke": "node scripts/smoke-test.mjs",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "phaser": "^3.90.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-basic-ssl": "^2.1.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.12"
+  }
+}

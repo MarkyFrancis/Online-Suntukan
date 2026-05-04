@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BSU ONLINE SUNTUKAN</title>
+  </head>
+  <body>
+    <div id="app">
+      <div id="game-root"></div>
+      <div id="ui-root">
+        <section id="title-screen" class="title-screen" aria-label="Main menu">
+          <h1>BSU ONLINE SUNTUKAN</h1>
+          <div class="title-actions">
+            <button id="title-pvp" type="button">PVP</button>
+            <button id="title-pvc" type="button">PVC</button>
+          </div>
+          <p>F: PVP · K: PVC</p>
+        </section>
+
+        <section id="character-select" class="character-select hidden" aria-label="Character select">
+          <div class="select-topline">
+            <span id="select-mode-label">PVP</span>
+            <span>Best of 5 · First to 3</span>
+          </div>
+          <div class="versus-layout">
+            <div class="big-preview p1-preview">
+              <span class="player-tag">P1</span>
+              <img id="p1-preview-img" alt="" />
+              <strong id="p1-preview-name">Player 1</strong>
+              <span id="p1-ready" class="ready-tag">Choosing</span>
+            </div>
+            <div class="versus-burst">VS</div>
+            <div class="big-preview p2-preview">
+              <span id="p2-label" class="player-tag">P2</span>
+              <img id="p2-preview-img" alt="" />
+              <strong id="p2-preview-name">Player 2</strong>
+              <span id="p2-ready" class="ready-tag">Choosing</span>
+            </div>
+          </div>
+          <div id="fighter-grid" class="fighter-grid" role="grid" aria-label="Fighter grid"></div>
+          <div class="control-strip">
+            <span>P1: WASD move · F confirm · G back</span>
+            <span>P2/CPU: Arrows move · K confirm · L back</span>
+            <span>Enter: continue</span>
+          </div>
+        </section>
+
+        <section id="stage-screen" class="stage-screen hidden" aria-label="Stage select">
+          <h2>Choose Stage</h2>
+          <div id="stage-grid" class="stage-grid" role="grid" aria-label="Stage grid"></div>
+          <div id="stage-name" class="stage-name">Stage</div>
+          <div class="control-strip">
+            <span>A/D or Arrows: choose stage</span>
+            <span>F/K/Enter/Space: fight</span>
+            <span>G/L/Escape: back</span>
+          </div>
+        </section>
+
+        <div id="hud" class="hud" aria-live="polite">
+          <div class="fighter-hud left">
+            <span id="p1-name" class="fighter-name">Player 1</span>
+            <div id="p1-rounds" class="round-pips"></div>
+            <div class="health-frame">
+              <div id="p1-health" class="health-fill p1"></div>
+            </div>
+            <div class="special-frame">
+              <div id="p1-special" class="special-fill p1"></div>
+              <span id="p1-special-label" class="special-label">SPECIAL</span>
+            </div>
+          </div>
+          <div class="center-hud">
+            <div id="timer" class="timer">60</div>
+            <button id="restart-round" type="button">Restart</button>
+          </div>
+          <div class="fighter-hud right">
+            <span id="p2-name" class="fighter-name">Player 2</span>
+            <div id="p2-rounds" class="round-pips"></div>
+            <div class="health-frame">
+              <div id="p2-health" class="health-fill p2"></div>
+            </div>
+            <div class="special-frame">
+              <div id="p2-special" class="special-fill p2"></div>
+              <span id="p2-special-label" class="special-label">SPECIAL</span>
+            </div>
+          </div>
+        </div>
+
+        <div id="round-banner" class="round-banner hidden">
+          <span id="round-message"></span>
+        </div>
+
+        <section id="pause-menu" class="pause-menu hidden" aria-label="Pause menu">
+          <h2>Paused</h2>
+          <div id="pause-options" class="pause-options"></div>
+          <p>W/S or Arrows · F/K/Enter/Space select · G/L/Escape resume</p>
+        </section>
+
+        <section id="match-winner" class="match-winner hidden" aria-label="Match winner">
+          <h2 id="match-winner-title">Winner</h2>
+          <button id="restart-match" type="button">Restart Match</button>
+          <button id="winner-main-menu" type="button">Main Menu</button>
+        </section>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
