@@ -208,7 +208,7 @@ export const fighterManifests: FighterAssetManifest[] = [
     poses: {
       idle: imagePose("esleigue", "idle", "right"),
       punch: imagePose("esleigue", "punch", "right"),
-      kick: imagePose("esleigue", "kick"),
+      kick: imagePose("esleigue", "kick", "left"),
       hurt: imagePose("esleigue", "hurt"),
       block: imagePose("esleigue", "block"),
       ko: imagePose("esleigue", "ko"),
