@@ -6,6 +6,14 @@ import {
 
 export type PoseName = "idle" | "punch" | "kick" | "hurt" | "block" | "ko";
 export type SpecialEffectKind = "super-flight" | "ground-smash" | "car-rush" | "fishing-trap" | "barbell" | "rasengan";
+export type VfxKey =
+  | "small-hit"
+  | "big-hit"
+  | "impact"
+  | "electric-shield"
+  | "explosion2"
+  | "hyperspeed"
+  | "charged";
 
 export type PoseAsset =
   | {
@@ -80,6 +88,25 @@ export type StageAssetManifest = {
   key: string;
   displayName: string;
   path: string;
+};
+
+export type VfxAssetManifest = {
+  key: VfxKey;
+  path: string;
+  frameWidth: number;
+  frameHeight: number;
+  frames: number;
+  frameRate: number;
+};
+
+export type VfxConfig = {
+  assetKey: VfxKey;
+  displayWidth: number;
+  displayHeight: number;
+  scale?: number;
+  offsetX?: number;
+  offsetY?: number;
+  flipWithFacing?: boolean;
 };
 
 export const stageManifests: StageAssetManifest[] = [
@@ -162,6 +189,7 @@ function framedSpecial(
   knockback: number,
   fullScreen = false,
   specialBaseFacing?: "left" | "right",
+  frameBasePath = `${fighterBase(fighterKey)}/${folder}`,
 ): SpecialAssetManifest {
   return {
     name,
@@ -173,7 +201,7 @@ function framedSpecial(
     },
     frameAssets: [1, 2, 3, 4, 5].map((frame) => ({
       key: `${fighterKey}-special-frame-${frame}`,
-      path: `${fighterBase(fighterKey)}/${folder}/frame_${frame}.png`,
+      path: `${frameBasePath}/frame_${frame}.png`,
     })),
     frameDurationsMs: defaultSpecialFrameDurations,
     impactFrame: 4,
@@ -369,9 +397,7 @@ export const fighterManifests: FighterAssetManifest[] = [
       ko: imagePose("mark", "ko"),
     },
     special: {
-      ...special("mark", "Rasengan", "rasengan", 260, defaultSpecialDurationMs, defaultSpecialHitAtMs, 380),
-      impactHoldMs: SPECIAL_IMPACT_HOLD_MS,
-      recoveryMs: SPECIAL_RECOVERY_MS,
+      ...framedSpecial("mark", "Rasengan", "rasengan", "special_mark", 260, 380, false, "right", "/assets/vfx/mark_special"),
     },
     voices: {
       attack: [`${fighterBase("mark")}/lizzzz.m4a`],
@@ -394,6 +420,93 @@ export const sfxManifest = {
   roundStart: { key: "sfx-round-start", path: "/assets/sfx/round_start.mp3" },
 } as const;
 
+export const extraSfxManifest = {
+  karloExplosion: { key: "sfx-karlo-explosion", path: "/assets/fighters/karlo/special_karlo/explosion.mp3" },
+  selectionComplete: [
+    { key: "sfx-selection-complete-1", path: "/assets/sfx/selection_complete/complete_1.mp3" },
+    { key: "sfx-selection-complete-2", path: "/assets/sfx/selection_complete/complete_2.mp3" },
+  ],
+  roundOver: [
+    { key: "sfx-round-over-1", path: "/assets/sfx/round_over/round_over_1.mp3" },
+    { key: "sfx-round-over-2", path: "/assets/sfx/round_over/round_over_2.mp3" },
+    { key: "sfx-round-over-3", path: "/assets/sfx/round_over/round_over_3.mp3" },
+  ],
+} as const;
+
+export const vfxAssetManifests: VfxAssetManifest[] = [
+  {
+    key: "small-hit",
+    path: "/assets/vfx/free_pack/small_hit.png",
+    frameWidth: 532,
+    frameHeight: 528,
+    frames: 30,
+    frameRate: 30,
+  },
+  {
+    key: "big-hit",
+    path: "/assets/vfx/free_pack/big_hit.png",
+    frameWidth: 557,
+    frameHeight: 553,
+    frames: 30,
+    frameRate: 30,
+  },
+  {
+    key: "impact",
+    path: "/assets/vfx/free_pack/impact.png",
+    frameWidth: 291,
+    frameHeight: 301,
+    frames: 30,
+    frameRate: 30,
+  },
+  {
+    key: "electric-shield",
+    path: "/assets/vfx/free_pack/electric_shield.png",
+    frameWidth: 265,
+    frameHeight: 265,
+    frames: 30,
+    frameRate: 30,
+  },
+  {
+    key: "explosion2",
+    path: "/assets/vfx/free_pack/explosion2.png",
+    frameWidth: 355,
+    frameHeight: 355,
+    frames: 30,
+    frameRate: 30,
+  },
+  {
+    key: "hyperspeed",
+    path: "/assets/vfx/free_pack/hyperspeed.png",
+    frameWidth: 517,
+    frameHeight: 515,
+    frames: 30,
+    frameRate: 30,
+  },
+  {
+    key: "charged",
+    path: "/assets/vfx/free_pack/charged.png",
+    frameWidth: 321,
+    frameHeight: 371,
+    frames: 42,
+    frameRate: 30,
+  },
+];
+
+export const attackVfxManifest: Record<"punch" | "kick" | "block", VfxConfig> = {
+  punch: { assetKey: "small-hit", displayWidth: 108, displayHeight: 108, offsetY: -4, flipWithFacing: true },
+  kick: { assetKey: "big-hit", displayWidth: 138, displayHeight: 136, offsetY: 6, flipWithFacing: true },
+  block: { assetKey: "electric-shield", displayWidth: 116, displayHeight: 116, offsetY: -4 },
+};
+
+export const specialVfxManifest: Record<SpecialEffectKind, VfxConfig> = {
+  "super-flight": { assetKey: "hyperspeed", displayWidth: 220, displayHeight: 180, offsetY: -18, flipWithFacing: true },
+  "ground-smash": { assetKey: "explosion2", displayWidth: 230, displayHeight: 210, offsetY: 22 },
+  "car-rush": { assetKey: "impact", displayWidth: 180, displayHeight: 150, offsetY: -8, flipWithFacing: true },
+  "fishing-trap": { assetKey: "impact", displayWidth: 138, displayHeight: 120, offsetY: -12, flipWithFacing: true },
+  barbell: { assetKey: "big-hit", displayWidth: 190, displayHeight: 184, offsetY: 0, flipWithFacing: true },
+  rasengan: { assetKey: "charged", displayWidth: 172, displayHeight: 196, offsetY: -14, flipWithFacing: true },
+};
+
 export function allPoseAssets(): PoseAsset[] {
   return fighterManifests.flatMap((fighter) => Object.values(fighter.poses));
 }
@@ -407,6 +520,22 @@ export function allSpecialAssets(): { key: string; path: string }[] {
 
 export function allPortraitAssets(): { key: string; path: string; sourceFacing?: "left" | "right" }[] {
   return fighterManifests.map((fighter) => fighter.portrait);
+}
+
+export function allExtraSfxAssets(): { key: string; path: string }[] {
+  return [
+    extraSfxManifest.karloExplosion,
+    ...extraSfxManifest.selectionComplete,
+    ...extraSfxManifest.roundOver,
+  ];
+}
+
+export function allVfxAssets(): VfxAssetManifest[] {
+  return vfxAssetManifests;
+}
+
+export function getVfxAsset(key: VfxKey): VfxAssetManifest | undefined {
+  return vfxAssetManifests.find((asset) => asset.key === key);
 }
 
 export function getFighterManifest(key: string): FighterAssetManifest {

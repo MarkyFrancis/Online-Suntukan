@@ -11,5 +11,10 @@ Placeholder sound effects in this folder are locally generated synthetic clips u
 | ko.mp3 | User-provided replacement: `KO sound.mp3` | User-provided project asset; license not specified |
 | menu_select.mp3 | User-provided replacement: `slectionsound.mp3` | User-provided project asset; license not specified |
 | round_start.mp3 | Locally generated synthetic round horn | CC0 / no attribution required |
+| selection_complete/complete_1.mp3 | User-provided meme select-complete sound: `milyon-pans.mp3` | User-provided project asset; license not specified |
+| selection_complete/complete_2.mp3 | User-provided meme select-complete sound: `walang-aawat.mp3` | User-provided project asset; license not specified |
+| round_over/round_over_1.mp3 | User-provided round-over meme sound | User-provided project asset; license not specified |
+| round_over/round_over_2.mp3 | User-provided round-over meme sound | User-provided project asset; license not specified |
+| round_over/round_over_3.mp3 | User-provided round-over meme sound | User-provided project asset; license not specified |
 
 Note: these are intentionally goofy placeholder sounds. Replace them with true MP3 files using the same names when you have final assets.

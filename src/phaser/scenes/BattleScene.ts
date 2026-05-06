@@ -1,22 +1,29 @@
 import Phaser from "phaser";
 import {
+  allExtraSfxAssets,
   allPortraitAssets,
   allPoseAssets,
   allSpecialAssets,
+  allVfxAssets,
   allVoicePaths,
+  attackVfxManifest,
+  extraSfxManifest,
   fighterManifests,
   getFighterManifest,
   getStageManifest,
+  getVfxAsset,
   menuMusicManifest,
   sfxManifest,
   shouldFlipFighterAsset,
   shouldFlipSpecialFrameAsset,
   shouldFlipSpecialAsset,
+  specialVfxManifest,
   stageManifests,
   type FighterAssetManifest,
   type PoseAsset,
   type PoseName,
   type SpecialEffectKind,
+  type VfxConfig,
 } from "../../game/assets/manifest";
 import { audioConfig } from "../../game/config/audio";
 import { aiDifficulty } from "../../game/config/ai";
@@ -26,6 +33,7 @@ import {
   SPECIAL_INTRO_PAUSE_MS,
   SPECIAL_NAME_DISPLAY_MS,
   SPECIAL_RECOVERY_MS,
+  type AttackName,
 } from "../../game/config/attacks";
 import { createKeyboardBindings, emptyInput, readInput, type KeyboardBindings } from "../../game/input/bindings";
 import { FighterAi } from "../../game/simulation/ai";
@@ -64,6 +72,8 @@ type WindowWithWebkitAudio = Window & {
 const voiceKeyByPath = new Map<string, string>();
 const sfxEntries = Object.values(sfxManifest);
 const winsNeeded = 3;
+const maxRoundOverPauseMs = 8000;
+const fallbackRoundOverPauseMs = 1500;
 
 export class BattleScene extends Phaser.Scene {
   private ui!: DomUi;
@@ -103,6 +113,16 @@ export class BattleScene extends Phaser.Scene {
   private specialEffectTimers: Phaser.Time.TimerEvent[] = [];
   private specialEffectTweens: Phaser.Tweens.Tween[] = [];
   private specialHtmlAudios: HTMLAudioElement[] = [];
+  private vfxObjects: Phaser.GameObjects.GameObject[] = [];
+  private vfxTweens: Phaser.Tweens.Tween[] = [];
+  private vfxTimers: Phaser.Time.TimerEvent[] = [];
+  private playingSfxKeys = new Set<string>();
+  private sfxCooldownUntil = new Map<string, number>();
+  private selectionConfirming = false;
+  private selectionConfirmEvent: Phaser.Time.TimerEvent | null = null;
+  private selectionConfirmTimers: Phaser.Time.TimerEvent[] = [];
+  private roundOverPlayed = false;
+  private lastRoundOverPauseMs = fallbackRoundOverPauseMs;
 
   constructor() {
     super("BattleScene");
@@ -125,6 +145,13 @@ export class BattleScene extends Phaser.Scene {
       this.load.image(specialAsset.key, specialAsset.path);
     }
 
+    for (const vfx of allVfxAssets()) {
+      this.load.spritesheet(vfx.key, vfx.path, {
+        frameWidth: vfx.frameWidth,
+        frameHeight: vfx.frameHeight,
+      });
+    }
+
     for (const [index, path] of allVoicePaths().entries()) {
       const key = `voice-${index}`;
       voiceKeyByPath.set(path, key);
@@ -133,13 +160,14 @@ export class BattleScene extends Phaser.Scene {
 
     this.load.audio(menuMusicManifest.key, menuMusicManifest.path);
 
-    for (const sfx of sfxEntries) {
+    for (const sfx of [...sfxEntries, ...allExtraSfxAssets()]) {
       this.load.audio(sfx.key, sfx.path);
     }
   }
 
   create() {
     this.ensureFallbackTextures();
+    this.createVfxAnimations();
     this.createBackground();
     this.createFloorMarks();
     this.keys = createKeyboardBindings(this);
@@ -194,6 +222,8 @@ export class BattleScene extends Phaser.Scene {
 
   private enterMainMenu() {
     this.stopRoundAdvance();
+    this.cancelSelectionConfirm();
+    this.stopTransientSfx();
     this.sim?.cancelSpecialSequence();
     this.cleanupSpecialEffects();
     this.resetMatch();
@@ -208,6 +238,8 @@ export class BattleScene extends Phaser.Scene {
 
   private enterCharacterSelect(mode: GameMode) {
     this.stopRoundAdvance();
+    this.cancelSelectionConfirm();
+    this.stopTransientSfx();
     this.sim?.cancelSpecialSequence();
     this.cleanupSpecialEffects();
     this.resetMatch();
@@ -226,6 +258,7 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private enterStageSelect() {
+    this.cancelSelectionConfirm();
     this.sim?.cancelSpecialSequence();
     this.cleanupSpecialEffects();
     this.screen = "stage";
@@ -252,6 +285,8 @@ export class BattleScene extends Phaser.Scene {
     this.cleanupSpecialEffects();
     this.screen = "playing";
     this.roundEndHandled = false;
+    this.roundOverPlayed = false;
+    this.stopTransientSfx();
     this.resetVoicePolicy();
     this.stopMenuMusic();
     this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
@@ -272,20 +307,23 @@ export class BattleScene extends Phaser.Scene {
         this.playAttackVoice(fighter, attackName);
       },
       onHit: (_attacker, victim, attackName) => {
+        this.playAttackImpactVfx(_attacker, victim, attackName);
         this.playSfx(
           attackName === "kick" ? sfxManifest.kickHit.key : sfxManifest.punchHit.key,
           attackName === "kick" ? "kickHit" : "punchHit",
         );
         this.playHurtVoice(victim);
       },
-      onBlock: () => {
+      onBlock: (attacker, victim) => {
+        this.playAttackImpactVfx(attacker, victim, "block");
         this.playSfx(sfxManifest.block.key, "block");
       },
       onSpecialStart: (fighter, victim) => {
         this.playSpecialCastSequence(fighter, victim);
       },
       onSpecialHit: (attacker, victim) => {
-        this.playSfx(sfxManifest.kickHit.key, "kickHit");
+        this.playSpecialImpactSfx(attacker);
+        this.playSpecialImpactVfx(attacker, victim);
         this.playSpecialImpact(attacker, victim);
         this.playHurtVoice(victim);
       },
@@ -293,7 +331,6 @@ export class BattleScene extends Phaser.Scene {
         this.cleanupSpecialEffects();
       },
       onKo: (winner) => {
-        this.playSfx(sfxManifest.ko.key, "ko");
         if (winner !== "draw") {
           const loser = winner === "p1" ? this.sim?.snapshot.fighters.p2 : this.sim?.snapshot.fighters.p1;
           if (loser) {
@@ -324,6 +361,7 @@ export class BattleScene extends Phaser.Scene {
     this.roundEndHandled = true;
     this.sim.cancelSpecialSequence();
     this.cleanupSpecialEffects();
+    const roundOverPauseMs = this.playRoundOverSfx();
     if (winner !== "draw") {
       this.score[winner] += 1;
     }
@@ -334,11 +372,11 @@ export class BattleScene extends Phaser.Scene {
     this.ui.showRoundMessage(winnerText);
 
     if (winner !== "draw" && this.score[winner] >= winsNeeded) {
-      this.roundAdvanceEvent = this.time.delayedCall(1600, () => this.showMatchWinner(winner));
+      this.roundAdvanceEvent = this.time.delayedCall(roundOverPauseMs, () => this.showMatchWinner(winner));
       return;
     }
 
-    this.roundAdvanceEvent = this.time.delayedCall(2100, () => this.startRound());
+    this.roundAdvanceEvent = this.time.delayedCall(roundOverPauseMs, () => this.startRound());
   }
 
   private showMatchWinner(winner: FighterId) {
@@ -349,6 +387,7 @@ export class BattleScene extends Phaser.Scene {
     this.sim.cancelSpecialSequence();
     this.cleanupSpecialEffects();
     this.sound.stopAll();
+    this.clearSfxGuards();
     this.ui.hideRoundMessage();
     this.ui.showMatchWinner(this.sim.snapshot.fighters[winner].def.displayName, this.score);
   }
@@ -385,6 +424,7 @@ export class BattleScene extends Phaser.Scene {
     }
 
     this.sound.stopAll();
+    this.clearSfxGuards();
     this.cleanupSpecialEffects();
     this.time.paused = false;
     this.tweens.resumeAll();
@@ -448,6 +488,10 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private handleCharacterSelectInput() {
+    if (this.selectionConfirming) {
+      return;
+    }
+
     let changed = false;
     if (!this.selectState.p1Locked) {
       const delta = this.cursorDelta("p1");
@@ -496,8 +540,7 @@ export class BattleScene extends Phaser.Scene {
         this.selectState.p2Locked = true;
       }
       if (this.selectState.p1Locked && this.selectState.p2Locked) {
-        this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
-        this.enterStageSelect();
+        this.confirmCharacterSelection();
         return;
       }
     }
@@ -596,6 +639,38 @@ export class BattleScene extends Phaser.Scene {
     this.roundAdvanceEvent = null;
   }
 
+  private cancelSelectionConfirm() {
+    this.selectionConfirmEvent?.remove(false);
+    this.selectionConfirmEvent = null;
+    for (const timer of this.selectionConfirmTimers) {
+      timer.remove(false);
+    }
+    this.selectionConfirmTimers = [];
+    this.selectionConfirming = false;
+  }
+
+  private confirmCharacterSelection() {
+    if (this.selectionConfirming) {
+      return;
+    }
+
+    this.selectionConfirming = true;
+    this.playSfx(sfxManifest.menuSelect.key, "menuSelect", { cooldownMs: 200 });
+    const [first, second] = extraSfxManifest.selectionComplete;
+    this.playSfx(first.key, "menuSelect", { oneShot: true, cooldownMs: 1200 });
+    this.selectionConfirmTimers.push(
+      this.time.delayedCall(450, () => {
+        this.playSfx(second.key, "menuSelect", { oneShot: true, cooldownMs: 1200 });
+      }),
+    );
+    this.selectionConfirmEvent = this.time.delayedCall(1000, () => {
+      this.selectionConfirmEvent = null;
+      this.selectionConfirming = false;
+      this.enterStageSelect();
+    });
+    this.selectionConfirmTimers.push(this.selectionConfirmEvent);
+  }
+
   private createMenuKeys(): MenuKeys {
     const keyboard = this.input.keyboard;
     if (!keyboard) {
@@ -661,6 +736,27 @@ export class BattleScene extends Phaser.Scene {
         this.createSpecialFallbackTexture(fighter.special.asset.key, fighter.special.effect, fighter.displayName);
       }
     }
+  }
+
+  private createVfxAnimations() {
+    for (const vfx of allVfxAssets()) {
+      if (!this.textures.exists(vfx.key)) {
+        continue;
+      }
+      const animationKey = this.vfxAnimationKey(vfx.key);
+      if (!this.anims.exists(animationKey)) {
+        this.anims.create({
+          key: animationKey,
+          frames: this.anims.generateFrameNumbers(vfx.key, { start: 0, end: vfx.frames - 1 }),
+          frameRate: vfx.frameRate,
+          repeat: 0,
+        });
+      }
+    }
+  }
+
+  private vfxAnimationKey(key: string) {
+    return `vfx-${key}`;
   }
 
   private createFallbackTexture(key: string, width: number, height: number, label: string | number, text: string) {
@@ -836,7 +932,51 @@ export class BattleScene extends Phaser.Scene {
     return timer;
   }
 
+  private trackVfxObject<T extends Phaser.GameObjects.GameObject>(object: T): T {
+    object.setData("vfxEffect", true);
+    this.vfxObjects.push(object);
+    return object;
+  }
+
+  private trackVfxTween(tween: Phaser.Tweens.Tween) {
+    this.vfxTweens.push(tween);
+    return tween;
+  }
+
+  private trackVfxTimer(timer: Phaser.Time.TimerEvent) {
+    this.vfxTimers.push(timer);
+    return timer;
+  }
+
+  private cleanupVfx() {
+    for (const timer of this.vfxTimers) {
+      timer.remove(false);
+    }
+    this.vfxTimers = [];
+
+    for (const tween of this.vfxTweens) {
+      tween.stop();
+      tween.remove();
+    }
+    this.vfxTweens = [];
+
+    const taggedObjects: Phaser.GameObjects.GameObject[] = [];
+    this.children.each((child) => {
+      if (child.getData("vfxEffect")) {
+        taggedObjects.push(child);
+      }
+    });
+    for (const object of [...this.vfxObjects, ...taggedObjects]) {
+      if (object.active) {
+        object.destroy();
+      }
+    }
+    this.vfxObjects = [];
+  }
+
   private cleanupSpecialEffects() {
+    this.cleanupVfx();
+
     for (const timer of this.specialEffectTimers) {
       timer.remove(false);
     }
@@ -880,6 +1020,48 @@ export class BattleScene extends Phaser.Scene {
       audio.remove();
     }
     this.specialHtmlAudios = [];
+  }
+
+  private playAttackImpactVfx(attacker: FighterState, victim: FighterState, attackName: AttackName | "block") {
+    const config = attackVfxManifest[attackName];
+    if (!config) {
+      return;
+    }
+    const x = victim.x - attacker.facing * 34;
+    const y = victim.y - (attackName === "kick" ? 98 : 126);
+    this.playConfiguredVfx(config, x, y, attacker.facing);
+  }
+
+  private playSpecialImpactVfx(attacker: FighterState, victim: FighterState) {
+    const config = specialVfxManifest[attacker.def.special.effect];
+    if (!config) {
+      return;
+    }
+    this.playConfiguredVfx(config, victim.x - attacker.facing * 22, victim.y - 92, attacker.facing);
+  }
+
+  private playConfiguredVfx(config: VfxConfig, x: number, y: number, facing: -1 | 1) {
+    const asset = getVfxAsset(config.assetKey);
+    if (!asset || !this.textures.exists(asset.key)) {
+      return;
+    }
+
+    const sprite = this.trackVfxObject(
+      this.add.sprite(x + (config.offsetX ?? 0) * facing, y + (config.offsetY ?? 0), asset.key),
+    );
+    sprite.setOrigin(0.5);
+    sprite.setDepth(15);
+    sprite.setDisplaySize(config.displayWidth * (config.scale ?? 1), config.displayHeight * (config.scale ?? 1));
+    sprite.setFlipX(Boolean(config.flipWithFacing && facing === -1));
+    sprite.play(this.vfxAnimationKey(asset.key));
+    sprite.once(Phaser.Animations.Events.ANIMATION_COMPLETE, () => {
+      sprite.destroy();
+    });
+    this.trackVfxTimer(this.time.delayedCall((asset.frames / asset.frameRate) * 1000 + 120, () => {
+      if (sprite.active) {
+        sprite.destroy();
+      }
+    }));
   }
 
   private playSpecialCastSequence(attacker: FighterState, victim: FighterState) {
@@ -1229,6 +1411,60 @@ export class BattleScene extends Phaser.Scene {
     }
   }
 
+  private playSpecialImpactSfx(attacker: FighterState) {
+    if (
+      attacker.def.key === "karlo" &&
+      this.playSfx(extraSfxManifest.karloExplosion.key, "kickHit", { oneShot: true, cooldownMs: 1200 })
+    ) {
+      return;
+    }
+    this.playSfx(sfxManifest.kickHit.key, "kickHit", { cooldownMs: 120 });
+  }
+
+  private playRoundOverSfx() {
+    if (this.roundOverPlayed) {
+      return this.lastRoundOverPauseMs;
+    }
+    this.roundOverPlayed = true;
+    const available = extraSfxManifest.roundOver.filter((sfx) => this.cache.audio.exists(sfx.key));
+    const chosen = available.length > 0 ? Phaser.Utils.Array.GetRandom(available) : null;
+    const key = chosen?.key ?? sfxManifest.ko.key;
+    this.lastRoundOverPauseMs = this.getAudioPauseMs(key);
+    if (chosen) {
+      this.playSfx(chosen.key, "ko", {
+        oneShot: true,
+        cooldownMs: maxRoundOverPauseMs,
+        volumeMultiplier: audioConfig.roundOverVolumeMultiplier,
+      });
+    } else {
+      this.playSfx(sfxManifest.ko.key, "ko", {
+        oneShot: true,
+        cooldownMs: maxRoundOverPauseMs,
+        volumeMultiplier: audioConfig.roundOverVolumeMultiplier,
+      });
+    }
+    return this.lastRoundOverPauseMs;
+  }
+
+  private getAudioPauseMs(key: string) {
+    const sound = this.sound.add(key, { volume: 0 });
+    const durationMs = sound.duration > 0 ? Math.ceil(sound.duration * 1000) : fallbackRoundOverPauseMs;
+    sound.destroy();
+    return Phaser.Math.Clamp(durationMs, fallbackRoundOverPauseMs, maxRoundOverPauseMs);
+  }
+
+  private clearSfxGuards() {
+    this.playingSfxKeys.clear();
+    this.sfxCooldownUntil.clear();
+  }
+
+  private stopTransientSfx() {
+    for (const sfx of [...sfxEntries, ...allExtraSfxAssets()]) {
+      this.sound.stopByKey(sfx.key);
+    }
+    this.clearSfxGuards();
+  }
+
   private playOptionalIdjaoSpecialAudio(attacker: FighterState, fileName: "special" | "special_hit") {
     if (attacker.def.key !== "idjao") {
       return;
@@ -1318,19 +1554,47 @@ export class BattleScene extends Phaser.Scene {
     }
   }
 
-  private playSfx(key: string, fallbackName: keyof typeof sfxManifest | string) {
+  private playSfx(
+    key: string,
+    fallbackName: keyof typeof sfxManifest | string,
+    options: { oneShot?: boolean; cooldownMs?: number; volumeMultiplier?: number } = {},
+  ): boolean {
     if (this.screen === "paused") {
-      return;
+      return false;
+    }
+    const now = this.time.now;
+    if (options.cooldownMs && now < (this.sfxCooldownUntil.get(key) ?? 0)) {
+      return false;
+    }
+    if (options.oneShot && this.playingSfxKeys.has(key)) {
+      return false;
+    }
+    if (options.cooldownMs) {
+      this.sfxCooldownUntil.set(key, now + options.cooldownMs);
     }
     if (this.cache.audio.exists(key)) {
       try {
-        this.sound.play(key, { volume: audioConfig.sfxVolume });
-        return;
+        const volume = Math.min(1, audioConfig.sfxVolume * (options.volumeMultiplier ?? 1));
+        if (options.oneShot) {
+          const sound = this.sound.add(key, { volume });
+          this.playingSfxKeys.add(key);
+          const clear = () => {
+            this.playingSfxKeys.delete(key);
+            sound.destroy();
+          };
+          sound.once("complete", clear);
+          sound.once("destroy", () => this.playingSfxKeys.delete(key));
+          sound.play();
+          return true;
+        }
+        this.sound.play(key, { volume });
+        return true;
       } catch {
         // Fall through to synthesized Web Audio when browser playback is blocked or decoding fails.
       }
     }
     this.playSynthFallback(fallbackName);
+    return true;
   }
 
   private playSynthFallback(name: string) {
