@@ -735,6 +735,9 @@ export class BattleScene extends Phaser.Scene {
       if (!this.textures.exists(fighter.special.asset.key)) {
         this.createSpecialFallbackTexture(fighter.special.asset.key, fighter.special.effect, fighter.displayName);
       }
+      if (fighter.special.projectileAsset && !this.textures.exists(fighter.special.projectileAsset.key)) {
+        this.createProjectileFallbackTexture(fighter.special.projectileAsset.key, fighter.special.effect);
+      }
     }
   }
 
@@ -772,7 +775,7 @@ export class BattleScene extends Phaser.Scene {
 
   private createSpecialFallbackTexture(key: string, effect: SpecialEffectKind, label: string) {
     const graphics = this.make.graphics({ x: 0, y: 0 }, false);
-    graphics.fillStyle(effect === "car-rush" ? 0x050505 : effect === "rasengan" ? 0x1c82ff : 0x2c3440, 1);
+    graphics.fillStyle(effect === "car-rush" ? 0x050505 : effect === "rasengan" ? 0x1c82ff : effect === "mango-projectile" ? 0x4bcf48 : 0x2c3440, 1);
     graphics.fillRoundedRect(0, 38, 220, 88, 18);
     graphics.fillStyle(0xffffff, 0.9);
     graphics.fillRoundedRect(38, 16, 88, 46, 12);
@@ -781,6 +784,35 @@ export class BattleScene extends Phaser.Scene {
     graphics.lineStyle(8, 0xffffff, 0.72);
     graphics.strokeRoundedRect(4, 4, 212, 132, 16);
     graphics.generateTexture(key, 220, 140);
+    graphics.destroy();
+  }
+
+  private createProjectileFallbackTexture(key: string, effect: SpecialEffectKind) {
+    const graphics = this.make.graphics({ x: 0, y: 0 }, false);
+    if (effect === "mango-projectile") {
+      graphics.fillStyle(0x4bff55, 0.38);
+      graphics.fillEllipse(62, 54, 108, 82);
+      graphics.fillStyle(0x89d12f, 1);
+      graphics.fillEllipse(58, 58, 74, 54);
+      graphics.fillStyle(0xffdf52, 1);
+      graphics.fillEllipse(50, 56, 42, 34);
+      graphics.lineStyle(5, 0xc9ff78, 0.95);
+      graphics.strokeEllipse(58, 58, 78, 58);
+      graphics.fillStyle(0x2e7b2d, 1);
+      graphics.fillEllipse(82, 28, 28, 12);
+      graphics.generateTexture(key, 124, 108);
+    } else {
+      graphics.fillStyle(0x9ba9b8, 1);
+      graphics.fillRoundedRect(40, 28, 78, 52, 8);
+      graphics.fillStyle(0x334155, 1);
+      graphics.fillRect(8, 22, 34, 64);
+      graphics.fillRect(116, 22, 34, 64);
+      graphics.lineStyle(4, 0xdbeafe, 0.9);
+      graphics.strokeRoundedRect(40, 28, 78, 52, 8);
+      graphics.lineStyle(5, 0x64748b, 1);
+      graphics.lineBetween(80, 80, 80, 118);
+      graphics.generateTexture(key, 158, 126);
+    }
     graphics.destroy();
   }
 
@@ -1162,6 +1194,10 @@ export class BattleScene extends Phaser.Scene {
       this.playFishingTrapEffect(attacker, victim);
     } else if (special.effect === "barbell") {
       this.playBarbellEffect(attacker, victim);
+    } else if (special.effect === "mango-projectile") {
+      this.playMangoProjectileEffect(attacker, victim);
+    } else if (special.effect === "satellite-strike") {
+      this.playSatelliteStrikeEffect(attacker, victim);
     } else {
       this.playRasenganEffect(attacker, victim);
     }
@@ -1219,17 +1255,23 @@ export class BattleScene extends Phaser.Scene {
 
   private hasSpecialFrameSequence(attacker: FighterState) {
     const frames = attacker.def.special.frameAssets ?? [];
-    return frames.length === 5 && frames.every((frame) => this.textures.exists(frame.key));
+    return frames.length > 0 && frames.every((frame) => this.textures.exists(frame.key));
   }
 
   private playSpecialFrameSequenceEffect(attacker: FighterState, victim: FighterState) {
     const frames = attacker.def.special.frameAssets ?? [];
     const frameDurations = this.getSpecialFrameDurations(attacker);
     const isCarRush = attacker.def.special.effect === "car-rush";
-    const startX = isCarRush ? (attacker.facing === 1 ? -170 : 1130) : attacker.x + attacker.facing * 24;
+    const isStationaryCaster =
+      attacker.def.special.effect === "mango-projectile" || attacker.def.special.effect === "satellite-strike";
+    const startX = isCarRush
+      ? (attacker.facing === 1 ? -170 : 1130)
+      : attacker.x + (isStationaryCaster ? 0 : attacker.facing * 24);
     const endX = isCarRush
       ? (attacker.facing === 1 ? 1130 : -170)
-      : Phaser.Math.Clamp(victim.x - attacker.facing * 36, 80, 880);
+      : isStationaryCaster
+        ? startX
+        : Phaser.Math.Clamp(victim.x - attacker.facing * 36, 80, 880);
     const y = isCarRush ? 414 : attacker.y;
     const width = isCarRush ? 300 : Math.max(attacker.def.body.drawWidth * 1.28, 270);
     const height = isCarRush ? 300 : Math.max(attacker.def.body.drawHeight * 1.22, 260);
@@ -1242,6 +1284,12 @@ export class BattleScene extends Phaser.Scene {
     const casterView = this.fighterViews.get(attacker.id);
     if (casterView) {
       casterView.sprite.setAlpha(0);
+    }
+
+    if (attacker.def.special.effect === "mango-projectile") {
+      this.playMangoProjectileEffect(attacker, victim);
+    } else if (attacker.def.special.effect === "satellite-strike") {
+      this.playSatelliteStrikeEffect(attacker, victim);
     }
 
     let elapsedMs = 0;
@@ -1287,6 +1335,151 @@ export class BattleScene extends Phaser.Scene {
     const frames = attacker.def.special.frameAssets ?? [];
     const configured = attacker.def.special.frameDurationsMs ?? [];
     return frames.map((_frame, index) => configured[index] ?? SPECIAL_FRAME_MS);
+  }
+
+  private getSpecialImpactVisualMs(attacker: FighterState) {
+    return this.getSpecialFrameStartMs(attacker, attacker.def.special.impactFrame ?? 4);
+  }
+
+  private getSpecialFrameStartMs(attacker: FighterState, frameNumber: number) {
+    const frameIndex = Math.max(0, frameNumber - 1);
+    return this.getSpecialFrameDurations(attacker)
+      .slice(0, frameIndex)
+      .reduce((total, duration) => total + duration, 0);
+  }
+
+  private playMangoProjectileEffect(attacker: FighterState, victim: FighterState) {
+    const spawnMs = this.getSpecialFrameStartMs(
+      attacker,
+      attacker.def.special.projectileSpawnFrame ?? attacker.def.special.impactFrame ?? 4,
+    );
+    const travelMs = Math.max(520, attacker.def.special.hitAtMs - spawnMs);
+    this.trackSpecialTimer(
+      this.time.delayedCall(spawnMs, () => {
+        const projectile = this.createProjectileSprite(attacker, 150, 118);
+        const targetIsInFront = attacker.facing === 1 ? victim.x >= attacker.x : victim.x <= attacker.x;
+        const startX = attacker.x + attacker.facing * 78;
+        const startY = attacker.y - 128;
+        const targetX = targetIsInFront ? victim.x - attacker.facing * 16 : attacker.facing === 1 ? 1080 : -120;
+        const targetY = targetIsInFront ? victim.y - 116 : startY;
+        projectile.setPosition(startX, startY);
+        projectile.setDisplaySize(88, 70);
+        projectile.setTint(0xcaff66);
+        const glow = this.trackSpecialObject(this.add.ellipse(startX, startY, 126, 86, 0x7cff4d, 0.24));
+        glow.setDepth(11);
+        const trail = this.trackSpecialObject(this.add.ellipse(startX - attacker.facing * 32, startY, 82, 44, 0x9bff5c, 0.18));
+        trail.setDepth(10);
+        this.trackSpecialTween(
+          this.tweens.add({
+            targets: projectile,
+            displayWidth: 166,
+            displayHeight: 130,
+            duration: 320,
+            ease: "Back.easeOut",
+            onUpdate: () => {
+              glow.setPosition(projectile.x, projectile.y);
+              trail.setPosition(projectile.x - attacker.facing * 32, projectile.y);
+            },
+          }),
+        );
+        this.trackSpecialTween(
+          this.tweens.add({
+            targets: projectile,
+            x: targetX,
+            y: targetY,
+            angle: 380 * attacker.facing,
+            duration: travelMs,
+            ease: "Cubic.easeIn",
+            onUpdate: () => {
+              glow.setPosition(projectile.x, projectile.y);
+              trail.setPosition(projectile.x - attacker.facing * 38, projectile.y);
+            },
+            onComplete: () => {
+              this.cameras.main.shake(150, 0.006);
+              this.trackSpecialTween(
+                this.tweens.add({
+                  targets: [projectile, glow, trail],
+                  alpha: 0,
+                  displayWidth: 188,
+                  displayHeight: 146,
+                  duration: 260,
+                  onComplete: () => {
+                    projectile.destroy();
+                    glow.destroy();
+                    trail.destroy();
+                  },
+                }),
+              );
+            },
+          }),
+        );
+      }),
+    );
+  }
+
+  private playSatelliteStrikeEffect(attacker: FighterState, victim: FighterState) {
+    const impactMs = this.getSpecialImpactVisualMs(attacker);
+    const targetX = Phaser.Math.Clamp(victim.x, 92, 868);
+    const targetY = victim.y - 68;
+    const warning = this.trackSpecialObject(this.add.ellipse(targetX, 463, 132, 34, 0xff3b30, 0.28));
+    warning.setDepth(6);
+    warning.setStrokeStyle(4, 0xfff1a6, 0.9);
+    this.trackSpecialTween(
+      this.tweens.add({
+        targets: warning,
+        alpha: 0.78,
+        scaleX: 1.18,
+        scaleY: 1.12,
+        duration: 220,
+        yoyo: true,
+        repeat: Math.max(2, Math.floor(impactMs / 440)),
+      }),
+    );
+
+    const fallStartMs = Math.max(260, impactMs - 820);
+    this.trackSpecialTimer(
+      this.time.delayedCall(fallStartMs, () => {
+        const satellite = this.createProjectileSprite(attacker, 146, 116);
+        satellite.setPosition(targetX - attacker.facing * 72, -86);
+        satellite.setAngle(18 * attacker.facing);
+        this.trackSpecialTween(
+          this.tweens.add({
+            targets: satellite,
+            x: targetX,
+            y: targetY,
+            angle: 0,
+            duration: Math.max(440, impactMs - fallStartMs),
+            ease: "Cubic.easeIn",
+            onComplete: () => {
+              this.cameras.main.shake(260, 0.013);
+              warning.destroy();
+              this.trackSpecialTween(
+                this.tweens.add({
+                  targets: satellite,
+                  alpha: 0,
+                  y: targetY + 28,
+                  duration: 260,
+                  onComplete: () => satellite.destroy(),
+                }),
+              );
+            },
+          }),
+        );
+      }),
+    );
+  }
+
+  private createProjectileSprite(attacker: FighterState, width: number, height: number) {
+    const asset = attacker.def.special.projectileAsset;
+    const textureKey = asset && this.textures.exists(asset.key) ? asset.key : attacker.def.special.asset.key;
+    const sprite = this.trackSpecialObject(this.add.sprite(attacker.x, attacker.y, textureKey));
+    const sourceFacing = asset?.sourceFacing ?? attacker.def.special.specialBaseFacing ?? attacker.def.baseFacing;
+    const unflippedFacing = sourceFacing === "right" ? 1 : -1;
+    sprite.setOrigin(0.5);
+    sprite.setDisplaySize(width, height);
+    sprite.setDepth(12);
+    sprite.setFlipX(attacker.facing !== unflippedFacing);
+    return sprite;
   }
 
   private playFishingTrapEffect(attacker: FighterState, victim: FighterState) {
@@ -1409,12 +1602,30 @@ export class BattleScene extends Phaser.Scene {
     if (attacker.def.special.effect === "rasengan") {
       this.cameras.main.flash(130, 70, 180, 255);
     }
+    if (attacker.def.special.effect === "mango-projectile") {
+      this.cameras.main.flash(110, 155, 255, 90);
+    }
+    if (attacker.def.special.effect === "satellite-strike") {
+      this.cameras.main.shake(300, 0.014);
+    }
   }
 
   private playSpecialImpactSfx(attacker: FighterState) {
     if (
       attacker.def.key === "karlo" &&
       this.playSfx(extraSfxManifest.karloExplosion.key, "kickHit", { oneShot: true, cooldownMs: 1200 })
+    ) {
+      return;
+    }
+    if (
+      attacker.def.key === "gerald" &&
+      this.playSfx(extraSfxManifest.geraldExplosion.key, "kickHit", { oneShot: true, cooldownMs: 1200 })
+    ) {
+      return;
+    }
+    if (
+      attacker.def.key === "idjao" &&
+      this.playSfx(extraSfxManifest.idjaoCarCrash.key, "kickHit", { oneShot: true, cooldownMs: 1200 })
     ) {
       return;
     }
@@ -1507,7 +1718,7 @@ export class BattleScene extends Phaser.Scene {
     if (this.screen === "paused" || fighter.health <= 0 || this.voicePolicy[fighter.id].koPlayed) {
       return;
     }
-    this.playRandomVoice(fighter.def.voices.special);
+    this.playFirstAvailableVoice(fighter.def.voices.special);
   }
 
   private playHurtVoice(fighter: FighterState) {
@@ -1534,9 +1745,21 @@ export class BattleScene extends Phaser.Scene {
       return;
     }
     const path = Phaser.Utils.Array.GetRandom(paths);
+    this.playVoicePath(path);
+  }
+
+  private playFirstAvailableVoice(paths: string[]) {
+    for (const path of paths) {
+      if (this.playVoicePath(path)) {
+        return;
+      }
+    }
+  }
+
+  private playVoicePath(path: string) {
     const key = voiceKeyByPath.get(path);
     if (!key || !this.cache.audio.exists(key) || this.playingVoiceKeys.has(key)) {
-      return;
+      return false;
     }
     try {
       const sound = this.sound.add(key, { volume: audioConfig.voiceVolume });
@@ -1549,8 +1772,10 @@ export class BattleScene extends Phaser.Scene {
         this.playingVoiceKeys.delete(key);
       });
       sound.play();
+      return true;
     } catch {
       this.playingVoiceKeys.delete(key);
+      return false;
     }
   }
 

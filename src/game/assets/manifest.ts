@@ -1,11 +1,20 @@
 import {
   SPECIAL_FRAME_DURATIONS_MS,
+  SPECIAL_FRAME_MS,
   SPECIAL_IMPACT_HOLD_MS,
   SPECIAL_RECOVERY_MS,
 } from "../config/attacks";
 
 export type PoseName = "idle" | "punch" | "kick" | "hurt" | "block" | "ko";
-export type SpecialEffectKind = "super-flight" | "ground-smash" | "car-rush" | "fishing-trap" | "barbell" | "rasengan";
+export type SpecialEffectKind =
+  | "super-flight"
+  | "ground-smash"
+  | "car-rush"
+  | "fishing-trap"
+  | "barbell"
+  | "rasengan"
+  | "mango-projectile"
+  | "satellite-strike";
 export type VfxKey =
   | "small-hit"
   | "big-hit"
@@ -46,6 +55,13 @@ export type SpecialAssetManifest = {
     path: string;
     sourceFacing?: "left" | "right";
   }[];
+  specialFrameCount?: number;
+  projectileAsset?: {
+    key: string;
+    path: string;
+    sourceFacing?: "left" | "right";
+  };
+  projectileSpawnFrame?: number;
   frameDurationsMs?: number[];
   impactFrame?: number;
   impactHoldMs?: number;
@@ -133,15 +149,29 @@ export const menuMusicManifest = {
 } as const;
 
 const fighterBase = (key: string) => `/assets/fighters/${key}`;
+const newFighterBase = (key: string) => `/assets/new_fighters/${key}`;
 const defaultSpecialFrameDurations = [...SPECIAL_FRAME_DURATIONS_MS];
 const defaultSpecialDurationMs = defaultSpecialFrameDurations.reduce((total, duration) => total + duration, 0);
 const defaultSpecialHitAtMs = defaultSpecialFrameDurations.slice(0, 3).reduce((total, duration) => total + duration, 0);
 
-function imagePose(fighterKey: string, poseName: PoseName, sourceFacing?: "left" | "right"): PoseAsset {
+function specialFrameNumbers(frameCount: number) {
+  return Array.from({ length: frameCount }, (_value, index) => index + 1);
+}
+
+function frameDurationsForCount(frameCount: number) {
+  return specialFrameNumbers(frameCount).map((_frame, index) => defaultSpecialFrameDurations[index] ?? SPECIAL_FRAME_MS);
+}
+
+function imagePose(
+  fighterKey: string,
+  poseName: PoseName,
+  sourceFacing?: "left" | "right",
+  basePath = fighterBase(fighterKey),
+): PoseAsset {
   return {
     type: "image",
     key: `${fighterKey}-${poseName}`,
-    path: `${fighterBase(fighterKey)}/${fighterKey}_${poseName}.png`,
+    path: `${basePath}/${fighterKey}_${poseName}.png`,
     sourceFacing,
   };
 }
@@ -190,7 +220,9 @@ function framedSpecial(
   fullScreen = false,
   specialBaseFacing?: "left" | "right",
   frameBasePath = `${fighterBase(fighterKey)}/${folder}`,
+  specialFrameCount = 5,
 ): SpecialAssetManifest {
+  const frameDurationsMs = frameDurationsForCount(specialFrameCount);
   return {
     name,
     effect,
@@ -199,15 +231,16 @@ function framedSpecial(
       key: `${fighterKey}-special`,
       path: `${fighterBase(fighterKey)}/special_spritesheet.png`,
     },
-    frameAssets: [1, 2, 3, 4, 5].map((frame) => ({
+    frameAssets: specialFrameNumbers(specialFrameCount).map((frame) => ({
       key: `${fighterKey}-special-frame-${frame}`,
       path: `${frameBasePath}/frame_${frame}.png`,
     })),
-    frameDurationsMs: defaultSpecialFrameDurations,
+    specialFrameCount,
+    frameDurationsMs,
     impactFrame: 4,
     impactHoldMs: SPECIAL_IMPACT_HOLD_MS,
     recoveryMs: SPECIAL_RECOVERY_MS,
-    durationMs: defaultSpecialDurationMs,
+    durationMs: frameDurationsMs.reduce((total, duration) => total + duration, 0),
     hitAtMs: defaultSpecialHitAtMs,
     range,
     height: 170,
@@ -246,7 +279,7 @@ export const fighterManifests: FighterAssetManifest[] = [
       attack: [`${fighterBase("esleigue")}/bananasaynomre.ogg`],
       hurt: [`${fighterBase("esleigue")}/monkey.m4a`],
       ko: [`${fighterBase("esleigue")}/monkey.m4a`],
-      special: [`${fighterBase("esleigue")}/bananasaynomre.ogg`],
+      special: ["/assets/character_sfx/esleigue/superman-intro.mp3", `${fighterBase("esleigue")}/bananasaynomre.ogg`],
     },
   },
   {
@@ -370,7 +403,7 @@ export const fighterManifests: FighterAssetManifest[] = [
       attack: [`${fighterBase("vince")}/five judges.m4a`],
       hurt: [`${fighterBase("vince")}/but wisdom speaks.m4a`],
       ko: [`${fighterBase("vince")}/but wisdom speaks.m4a`],
-      special: [`${fighterBase("vince")}/five judges.m4a`],
+      special: ["/assets/character_sfx/vince/special_sound.mp3"],
     },
   },
   {
@@ -406,6 +439,108 @@ export const fighterManifests: FighterAssetManifest[] = [
       special: [`${fighterBase("mark")}/lizzzz.m4a`],
     },
   },
+  {
+    key: "hernandez",
+    displayName: "Hernandez",
+    baseFacing: "left",
+    portrait: {
+      key: "hernandez-portrait",
+      path: `${newFighterBase("hernandez")}/portrait.png`,
+      sourceFacing: "right",
+    },
+    scale: 1,
+    body: {
+      width: 96,
+      height: 194,
+      drawWidth: 218,
+      drawHeight: 218,
+    },
+    poses: {
+      idle: imagePose("hernandez", "idle", "left", newFighterBase("hernandez")),
+      punch: imagePose("hernandez", "punch", "left", newFighterBase("hernandez")),
+      kick: imagePose("hernandez", "kick", "left", newFighterBase("hernandez")),
+      hurt: imagePose("hernandez", "hurt", "left", newFighterBase("hernandez")),
+      block: imagePose("hernandez", "block", "left", newFighterBase("hernandez")),
+      ko: imagePose("hernandez", "ko", "left", newFighterBase("hernandez")),
+    },
+    special: {
+      ...framedSpecial(
+        "hernandez",
+        "Mangoe Namo",
+        "mango-projectile",
+        "special",
+        880,
+        360,
+        false,
+        "right",
+        `${newFighterBase("hernandez")}/special`,
+        6,
+      ),
+      impactFrame: 5,
+      projectileSpawnFrame: 5,
+      hitAtMs: 2700,
+      projectileAsset: {
+        key: "hernandez-mango-projectile",
+        path: `${newFighterBase("hernandez")}/special/mango_projectile.png`,
+        sourceFacing: "right",
+      },
+    },
+    voices: {
+      attack: [],
+      hurt: [],
+      ko: [],
+      special: [`${newFighterBase("hernandez")}/special/wag-kang-bastos-reloaded.mp3`],
+    },
+  },
+  {
+    key: "gerald",
+    displayName: "Gerald",
+    baseFacing: "left",
+    portrait: {
+      key: "gerald-portrait",
+      path: `${newFighterBase("gerald")}/portrait.png`,
+      sourceFacing: "right",
+    },
+    scale: 1,
+    body: {
+      width: 96,
+      height: 194,
+      drawWidth: 218,
+      drawHeight: 218,
+    },
+    poses: {
+      idle: imagePose("gerald", "idle", "left", newFighterBase("gerald")),
+      punch: imagePose("gerald", "punch", "left", newFighterBase("gerald")),
+      kick: imagePose("gerald", "kick", "left", newFighterBase("gerald")),
+      hurt: imagePose("gerald", "hurt", "left", newFighterBase("gerald")),
+      block: imagePose("gerald", "block", "left", newFighterBase("gerald")),
+      ko: imagePose("gerald", "ko", "left", newFighterBase("gerald")),
+    },
+    special: {
+      ...framedSpecial(
+        "gerald",
+        "Supa Hacka",
+        "satellite-strike",
+        "special",
+        920,
+        420,
+        true,
+        "right",
+        `${newFighterBase("gerald")}/special`,
+      ),
+      projectileAsset: {
+        key: "gerald-satellite",
+        path: `${newFighterBase("gerald")}/special/satellite.png`,
+        sourceFacing: "right",
+      },
+    },
+    voices: {
+      attack: [],
+      hurt: [],
+      ko: [],
+      special: [`${newFighterBase("gerald")}/special/gerald_specialsound.mp3`],
+    },
+  },
 ];
 
 export const audioFormats = [".mp3", ".m4a", ".ogg"] as const;
@@ -422,6 +557,8 @@ export const sfxManifest = {
 
 export const extraSfxManifest = {
   karloExplosion: { key: "sfx-karlo-explosion", path: "/assets/fighters/karlo/special_karlo/explosion.mp3" },
+  geraldExplosion: { key: "sfx-gerald-explosion", path: "/assets/new_fighters/gerald/special/explosion.mp3" },
+  idjaoCarCrash: { key: "sfx-idjao-car-crash", path: "/assets/character_sfx/idjao/car_crash.mp3" },
   selectionComplete: [
     { key: "sfx-selection-complete-1", path: "/assets/sfx/selection_complete/complete_1.mp3" },
     { key: "sfx-selection-complete-2", path: "/assets/sfx/selection_complete/complete_2.mp3" },
@@ -505,6 +642,8 @@ export const specialVfxManifest: Record<SpecialEffectKind, VfxConfig> = {
   "fishing-trap": { assetKey: "impact", displayWidth: 138, displayHeight: 120, offsetY: -12, flipWithFacing: true },
   barbell: { assetKey: "big-hit", displayWidth: 190, displayHeight: 184, offsetY: 0, flipWithFacing: true },
   rasengan: { assetKey: "charged", displayWidth: 172, displayHeight: 196, offsetY: -14, flipWithFacing: true },
+  "mango-projectile": { assetKey: "charged", displayWidth: 150, displayHeight: 170, offsetY: -20, flipWithFacing: true },
+  "satellite-strike": { assetKey: "explosion2", displayWidth: 240, displayHeight: 230, offsetY: 26 },
 };
 
 export function allPoseAssets(): PoseAsset[] {
@@ -515,6 +654,7 @@ export function allSpecialAssets(): { key: string; path: string }[] {
   return fighterManifests.flatMap((fighter) => [
     fighter.special.asset,
     ...(fighter.special.frameAssets ?? []),
+    ...(fighter.special.projectileAsset ? [fighter.special.projectileAsset] : []),
   ]);
 }
 
@@ -525,6 +665,8 @@ export function allPortraitAssets(): { key: string; path: string; sourceFacing?:
 export function allExtraSfxAssets(): { key: string; path: string }[] {
   return [
     extraSfxManifest.karloExplosion,
+    extraSfxManifest.geraldExplosion,
+    extraSfxManifest.idjaoCarCrash,
     ...extraSfxManifest.selectionComplete,
     ...extraSfxManifest.roundOver,
   ];
