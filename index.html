@@ -9,13 +9,40 @@
     <div id="app">
       <div id="game-root"></div>
       <div id="ui-root">
+        <section id="loading-screen" class="loading-screen" aria-label="Loading game">
+          <div class="loading-mark">
+            <span>Loading</span>
+            <strong>BSU ONLINE SUNTUKAN</strong>
+          </div>
+        </section>
         <section id="title-screen" class="title-screen" aria-label="Main menu">
-          <h1>BSU ONLINE SUNTUKAN</h1>
+          <h1 aria-label="BSU Online Suntukan">
+            <span class="title-word word-bsu">BSU</span>
+            <span class="title-word word-online">ONLINE</span>
+            <span class="title-word word-suntukan">SUNTUKAN</span>
+          </h1>
           <div class="title-actions">
             <button id="title-pvp" type="button">PVP</button>
             <button id="title-pvc" type="button">PVC</button>
+            <button id="title-settings" type="button">Settings</button>
           </div>
-          <p>F: PVP · K: PVC</p>
+          <p>F starts PVP - K starts PVC - M opens Settings</p>
+        </section>
+
+        <section id="settings-menu" class="settings-menu hidden" aria-label="Settings menu">
+          <div class="settings-card">
+            <h2>Settings</h2>
+            <div class="settings-row">
+              <span>Background Music</span>
+              <div class="music-selector settings-music-selector" aria-label="Background music selector">
+                <button id="music-prev" type="button" aria-label="Previous music">&lt;</button>
+                <strong id="music-choice">Taguro Song</strong>
+                <button id="music-next" type="button" aria-label="Next music">&gt;</button>
+              </div>
+            </div>
+            <button id="settings-close" type="button">Back</button>
+            <p>A/D or Arrows change music - G/Escape goes back</p>
+          </div>
         </section>
 
         <section id="character-select" class="character-select hidden" aria-label="Character select">
@@ -40,8 +67,8 @@
           </div>
           <div id="fighter-grid" class="fighter-grid" role="grid" aria-label="Fighter grid"></div>
           <div class="control-strip">
-            <span>P1: WASD move · F confirm · G back</span>
-            <span>P2/CPU: Arrows move · K confirm · L back</span>
+            <span>P1: A/D move - W jump - S block - F punch - F,F combo - G kick</span>
+            <span>P2/CPU: Arrows move - Down block - K punch - K,K combo - L kick</span>
             <span>Enter: continue</span>
           </div>
         </section>

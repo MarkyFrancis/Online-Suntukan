@@ -1,5 +1,10 @@
-import type { FighterAssetManifest, StageAssetManifest } from "../game/assets/manifest";
+import { isFighterPlayable, type FighterAssetManifest, type StageAssetManifest } from "../game/assets/manifest";
 import type { FighterId, GameMode, RoundSnapshot } from "../game/simulation/types";
+
+export type MusicChoice = {
+  key: string;
+  displayName: string;
+};
 
 export type RoundSelection = {
   mode: GameMode;
@@ -23,6 +28,9 @@ type UiCallbacks = {
   chooseMode: (mode: GameMode) => void;
   previewSelection: (selection: Omit<RoundSelection, "mode">) => void;
   startMatch: (selection: RoundSelection) => void;
+  changeMusic: (delta: number) => void;
+  openSettings: () => void;
+  closeSettings: () => void;
   pauseAction: (action: PauseAction) => void;
   restartMatch: () => void;
   mainMenu: () => void;
@@ -32,6 +40,12 @@ type UiElements = {
   titleScreen: HTMLElement;
   titlePvp: HTMLButtonElement;
   titlePvc: HTMLButtonElement;
+  titleSettings: HTMLButtonElement;
+  settingsMenu: HTMLElement;
+  settingsClose: HTMLButtonElement;
+  musicPrev: HTMLButtonElement;
+  musicNext: HTMLButtonElement;
+  musicChoice: HTMLElement;
   characterSelect: HTMLElement;
   selectModeLabel: HTMLElement;
   fighterGrid: HTMLElement;
@@ -85,6 +99,7 @@ export class DomUi {
     private readonly callbacks: UiCallbacks,
     private readonly fighters: FighterAssetManifest[],
     private readonly stages: StageAssetManifest[],
+    private readonly musicChoices: MusicChoice[],
   ) {
     this.elements = this.getElements();
     const firstFighter = fighters[0]?.key ?? "";
@@ -99,6 +114,10 @@ export class DomUi {
     this.renderPauseOptions();
     this.elements.titlePvp.addEventListener("click", () => callbacks.chooseMode("pvp"));
     this.elements.titlePvc.addEventListener("click", () => callbacks.chooseMode("pvc"));
+    this.elements.titleSettings.addEventListener("click", callbacks.openSettings);
+    this.elements.settingsClose.addEventListener("click", callbacks.closeSettings);
+    this.elements.musicPrev.addEventListener("click", () => callbacks.changeMusic(-1));
+    this.elements.musicNext.addEventListener("click", () => callbacks.changeMusic(1));
     this.elements.restartButton.addEventListener("click", () => callbacks.pauseAction("restart-round"));
     this.elements.restartMatch.addEventListener("click", callbacks.restartMatch);
     this.elements.winnerMainMenu.addEventListener("click", callbacks.mainMenu);
@@ -109,6 +128,21 @@ export class DomUi {
     this.elements.banner.classList.add("hidden");
     this.elements.pauseMenu.classList.add("hidden");
     this.elements.matchWinner.classList.add("hidden");
+    this.hideSettingsMenu();
+  }
+
+  showSettingsMenu() {
+    this.elements.settingsMenu.classList.remove("hidden");
+  }
+
+  hideSettingsMenu() {
+    this.elements.settingsMenu.classList.add("hidden");
+  }
+
+  updateMusicChoice(choiceKey: string) {
+    const selected = this.musicChoices.find((choice) => choice.key === choiceKey) ?? this.musicChoices[0];
+    this.elements.musicChoice.textContent = selected?.displayName ?? "No Music";
+    this.elements.musicChoice.classList.toggle("no-music", selected?.key === "none");
   }
 
   showCharacterSelect(snapshot: SelectSnapshot) {
@@ -119,31 +153,33 @@ export class DomUi {
   updateCharacterSelect(snapshot: SelectSnapshot) {
     const p1 = this.fighters[snapshot.p1Index] ?? this.fighters[0];
     const p2 = this.fighters[snapshot.p2Index] ?? this.fighters[0];
+    const p1Playable = isFighterPlayable(p1);
+    const p2Playable = isFighterPlayable(p2);
     this.elements.selectModeLabel.textContent = snapshot.mode.toUpperCase();
     this.elements.p2Label.textContent = snapshot.mode === "pvc" ? "CPU" : "P2";
-    this.elements.p1PreviewImg.onerror = () => {
-      this.elements.p1PreviewImg.src = p1.poses.idle.path;
-    };
-    this.elements.p2PreviewImg.onerror = () => {
-      this.elements.p2PreviewImg.src = p2.poses.idle.path;
-    };
-    this.elements.p1PreviewImg.src = p1.portrait.path;
-    this.elements.p2PreviewImg.src = p2.portrait.path;
+    this.setPreviewImage(this.elements.p1PreviewImg, p1);
+    this.setPreviewImage(this.elements.p2PreviewImg, p2);
     this.elements.p1PreviewImg.classList.toggle("source-right", (p1.portrait.sourceFacing ?? p1.baseFacing) === "right");
     this.elements.p2PreviewImg.classList.toggle("source-right", (p2.portrait.sourceFacing ?? p2.baseFacing) === "right");
     this.elements.p1PreviewName.textContent = p1.displayName;
     this.elements.p2PreviewName.textContent = p2.displayName;
-    this.elements.p1Ready.textContent = snapshot.p1Locked ? "Ready" : "Choosing";
-    this.elements.p2Ready.textContent = snapshot.p2Locked ? "Ready" : "Choosing";
-    this.elements.p1Ready.classList.toggle("ready", snapshot.p1Locked);
-    this.elements.p2Ready.classList.toggle("ready", snapshot.p2Locked);
+    this.elements.p1Ready.textContent = p1Playable ? (snapshot.p1Locked ? "Ready" : "Choosing") : "Coming Soon";
+    this.elements.p2Ready.textContent = p2Playable ? (snapshot.p2Locked ? "Ready" : "Choosing") : "Coming Soon";
+    this.elements.p1Ready.classList.toggle("ready", p1Playable && snapshot.p1Locked);
+    this.elements.p2Ready.classList.toggle("ready", p2Playable && snapshot.p2Locked);
+    this.elements.p1Ready.classList.toggle("locked", !p1Playable);
+    this.elements.p2Ready.classList.toggle("locked", !p2Playable);
+    this.elements.p1PreviewImg.parentElement?.classList.toggle("preview-locked", !p1Playable);
+    this.elements.p2PreviewImg.parentElement?.classList.toggle("preview-locked", !p2Playable);
 
     for (const button of this.elements.fighterGrid.querySelectorAll<HTMLButtonElement>(".fighter-cell")) {
       const index = Number(button.dataset.index ?? 0);
+      const fighter = this.fighters[index];
       button.classList.toggle("p1-cursor", index === snapshot.p1Index);
       button.classList.toggle("p2-cursor", index === snapshot.p2Index);
       button.classList.toggle("p1-locked", snapshot.p1Locked && index === snapshot.p1Index);
       button.classList.toggle("p2-locked", snapshot.p2Locked && index === snapshot.p2Index);
+      button.classList.toggle("locked", fighter ? !isFighterPlayable(fighter) : false);
     }
   }
 
@@ -189,22 +225,32 @@ export class DomUi {
       this.elements.p2Special.style.width = "0%";
       this.elements.p1SpecialLabel.textContent = "SPECIAL";
       this.elements.p2SpecialLabel.textContent = "SPECIAL";
+      this.setBarState(this.elements.p1Health, false, "danger");
+      this.setBarState(this.elements.p2Health, false, "danger");
+      this.setBarState(this.elements.p1Special, false, "ready");
+      this.setBarState(this.elements.p2Special, false, "ready");
       this.elements.timer.textContent = "120";
       return;
     }
 
     const { p1, p2 } = snapshot.fighters;
+    const p1HealthRatio = p1.health / p1.maxHealth;
+    const p2HealthRatio = p2.health / p2.maxHealth;
     this.elements.p1Name.textContent = p1.def.displayName;
     this.elements.p2Name.textContent =
       snapshot.mode === "pvc" ? `${p2.def.displayName} CPU` : p2.def.displayName;
-    this.elements.p1Health.style.width = `${Math.max(0, (p1.health / p1.maxHealth) * 100)}%`;
-    this.elements.p2Health.style.width = `${Math.max(0, (p2.health / p2.maxHealth) * 100)}%`;
+    this.elements.p1Health.style.width = `${Math.max(0, p1HealthRatio * 100)}%`;
+    this.elements.p2Health.style.width = `${Math.max(0, p2HealthRatio * 100)}%`;
     this.elements.p1Special.style.width = `${Math.max(0, p1.specialMeter)}%`;
     this.elements.p2Special.style.width = `${Math.max(0, p2.specialMeter)}%`;
     this.elements.p1SpecialLabel.textContent = p1.specialMeter >= 100 ? "SPECIAL READY" : p1.def.special.name;
     this.elements.p2SpecialLabel.textContent = p2.specialMeter >= 100 ? "SPECIAL READY" : p2.def.special.name;
     this.elements.p1SpecialLabel.classList.toggle("ready", p1.specialMeter >= 100);
     this.elements.p2SpecialLabel.classList.toggle("ready", p2.specialMeter >= 100);
+    this.setBarState(this.elements.p1Health, p1HealthRatio <= 0.28, "danger");
+    this.setBarState(this.elements.p2Health, p2HealthRatio <= 0.28, "danger");
+    this.setBarState(this.elements.p1Special, p1.specialMeter >= 100, "ready");
+    this.setBarState(this.elements.p2Special, p2.specialMeter >= 100, "ready");
     this.elements.timer.textContent = `${Math.ceil(snapshot.timerMs / 1000)}`;
   }
 
@@ -250,6 +296,9 @@ export class DomUi {
     this.elements.titleScreen.classList.toggle("hidden", screen !== "title");
     this.elements.characterSelect.classList.toggle("hidden", screen !== "characters");
     this.elements.stageScreen.classList.toggle("hidden", screen !== "stage");
+    if (screen !== "title") {
+      this.hideSettingsMenu();
+    }
   }
 
   private renderFighterGrid() {
@@ -260,16 +309,44 @@ export class DomUi {
       button.type = "button";
       button.className = "fighter-cell";
       button.dataset.index = `${index}`;
+      const playable = isFighterPlayable(fighter);
+      button.classList.toggle("locked", !playable);
+      button.disabled = !playable;
+      button.setAttribute("aria-disabled", `${!playable}`);
       const img = document.createElement("img");
       img.alt = "";
-      img.src = fighter.portrait.path;
-      img.onerror = () => {
-        img.src = fighter.poses.idle.path;
-      };
+      if (fighter.portrait.path) {
+        img.src = fighter.portrait.path;
+        img.onerror = () => {
+          img.removeAttribute("src");
+          img.classList.add("missing-portrait");
+        };
+      } else {
+        img.classList.add("missing-portrait");
+      }
       const label = document.createElement("span");
       label.textContent = fighter.displayName;
       button.append(img, label);
+      if (!playable) {
+        const status = document.createElement("small");
+        status.textContent = "Coming Soon";
+        button.append(status);
+      }
       this.elements.fighterGrid.append(button);
+    }
+  }
+
+  private setPreviewImage(image: HTMLImageElement, fighter: FighterAssetManifest) {
+    image.classList.remove("missing-portrait");
+    image.onerror = () => {
+      image.removeAttribute("src");
+      image.classList.add("missing-portrait");
+    };
+    if (fighter.portrait.path) {
+      image.src = fighter.portrait.path;
+    } else {
+      image.removeAttribute("src");
+      image.classList.add("missing-portrait");
     }
   }
 
@@ -316,11 +393,21 @@ export class DomUi {
     });
   }
 
+  private setBarState(fill: HTMLElement, enabled: boolean, className: string) {
+    fill.parentElement?.classList.toggle(className, enabled);
+  }
+
   private getElements(): UiElements {
     return {
       titleScreen: this.mustGet("title-screen"),
       titlePvp: this.mustGetButton("title-pvp"),
       titlePvc: this.mustGetButton("title-pvc"),
+      titleSettings: this.mustGetButton("title-settings"),
+      settingsMenu: this.mustGet("settings-menu"),
+      settingsClose: this.mustGetButton("settings-close"),
+      musicPrev: this.mustGetButton("music-prev"),
+      musicNext: this.mustGetButton("music-next"),
+      musicChoice: this.mustGet("music-choice"),
       characterSelect: this.mustGet("character-select"),
       selectModeLabel: this.mustGet("select-mode-label"),
       fighterGrid: this.mustGet("fighter-grid"),

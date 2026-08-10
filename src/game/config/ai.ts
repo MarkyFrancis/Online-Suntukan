@@ -9,6 +9,8 @@ export type AiDifficulty = {
   attackRange: number;
   specialChance: number;
   specialRange: number;
+  blockChance: number;
+  punishChance: number;
 };
 
 export const aiDifficulty: AiDifficulty = {
@@ -20,6 +22,8 @@ export const aiDifficulty: AiDifficulty = {
   farRange: 190,
   closeRange: 72,
   attackRange: 118,
-  specialChance: 0.22,
+  specialChance: 0.18,
   specialRange: 300,
+  blockChance: 0.5,
+  punishChance: 0.38,
 };

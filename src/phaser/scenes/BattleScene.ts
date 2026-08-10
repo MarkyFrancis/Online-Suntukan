@@ -1,5 +1,6 @@
 import Phaser from "phaser";
 import {
+  allFrameAnimationAssets,
   allExtraSfxAssets,
   allPortraitAssets,
   allPoseAssets,
@@ -12,7 +13,9 @@ import {
   getFighterManifest,
   getStageManifest,
   getVfxAsset,
-  menuMusicManifest,
+  isFighterPlayable,
+  menuLightningManifests,
+  menuMusicTrackManifests,
   sfxManifest,
   shouldFlipFighterAsset,
   shouldFlipSpecialFrameAsset,
@@ -20,6 +23,7 @@ import {
   specialVfxManifest,
   stageManifests,
   type FighterAssetManifest,
+  type MovementAnimationName,
   type PoseAsset,
   type PoseName,
   type SpecialEffectKind,
@@ -27,6 +31,8 @@ import {
 } from "../../game/assets/manifest";
 import { audioConfig } from "../../game/config/audio";
 import { aiDifficulty } from "../../game/config/ai";
+import { arcadeFonts } from "../../game/config/fonts";
+import { menuLightningConfig, specialIntroPresentation } from "../../game/config/presentation";
 import {
   SPECIAL_ANIMATION_FRAME_RATE,
   SPECIAL_FRAME_MS,
@@ -39,12 +45,17 @@ import { createKeyboardBindings, emptyInput, readInput, type KeyboardBindings } 
 import { FighterAi } from "../../game/simulation/ai";
 import { RoundSimulation } from "../../game/simulation/RoundSimulation";
 import type { FighterId, FighterState, GameMode, RoundSnapshot } from "../../game/simulation/types";
-import { DomUi, type MatchScore, type PauseAction, type RoundSelection, type SelectSnapshot } from "../../ui/dom";
+import { DomUi, type MatchScore, type MusicChoice, type PauseAction, type RoundSelection, type SelectSnapshot } from "../../ui/dom";
 
 type FighterView = {
   sprite: Phaser.GameObjects.Sprite;
   shadow: Phaser.GameObjects.Ellipse;
   lastPose: PoseName | null;
+  frameAnimation: {
+    name: MovementAnimationName | null;
+    frameIndex: number;
+    nextFrameAtMs: number;
+  };
   effect: {
     offsetX: number;
     offsetY: number;
@@ -55,7 +66,7 @@ type FighterView = {
 
 type ScreenState = "title" | "characters" | "stage" | "playing" | "paused" | "match-over";
 type MenuKeys = Record<
-  "enter" | "escape" | "space" | "p1Up" | "p1Down" | "p2Up" | "p2Down" | "p1Back" | "p2Back",
+  "enter" | "escape" | "space" | "music" | "p1Up" | "p1Down" | "p2Up" | "p2Down" | "p1Back" | "p2Back",
   Phaser.Input.Keyboard.Key
 >;
 
@@ -74,6 +85,18 @@ const sfxEntries = Object.values(sfxManifest);
 const winsNeeded = 3;
 const maxRoundOverPauseMs = 8000;
 const fallbackRoundOverPauseMs = 1500;
+const noMusicKey = "none";
+const defaultMusicKey = "music-taguro-song";
+const musicStorageKey = "bsu-online-suntukan.music";
+const retiredMusicKeyMigration: Record<string, string> = {
+  "music-ptangona-remix": "music-menu",
+  "music-ptangona-remix-alt": "music-menu",
+  "music-pngoa-remix": "music-menu",
+};
+const musicChoices: MusicChoice[] = [
+  { key: noMusicKey, displayName: "No Music" },
+  ...menuMusicTrackManifests.map((track) => ({ key: track.key, displayName: track.displayName })),
+];
 
 export class BattleScene extends Phaser.Scene {
   private ui!: DomUi;
@@ -87,6 +110,7 @@ export class BattleScene extends Phaser.Scene {
   private hasStarted = false;
   private stageIndex = 0;
   private pauseIndex = 0;
+  private settingsOpen = false;
   private roundAdvanceEvent: Phaser.Time.TimerEvent | null = null;
   private roundEndHandled = false;
   private selectState: SelectSnapshot = {
@@ -108,7 +132,13 @@ export class BattleScene extends Phaser.Scene {
     p2: { hurtReadyAtMs: 0, koPlayed: false },
   };
   private playingVoiceKeys = new Set<string>();
+  private specialActivationSounds: Phaser.Sound.BaseSound[] = [];
+  private currentGroundY = 474;
   private menuMusic: Phaser.Sound.BaseSound | null = null;
+  private menuMusicKey: string | null = null;
+  private selectedMusicKey = defaultMusicKey;
+  private menuLightningTimers: Phaser.Time.TimerEvent[] = [];
+  private menuLightningElements: HTMLElement[] = [];
   private specialEffectObjects: Phaser.GameObjects.GameObject[] = [];
   private specialEffectTimers: Phaser.Time.TimerEvent[] = [];
   private specialEffectTweens: Phaser.Tweens.Tween[] = [];
@@ -137,6 +167,10 @@ export class BattleScene extends Phaser.Scene {
       this.load.image(portrait.key, portrait.path);
     }
 
+    for (const frame of allFrameAnimationAssets()) {
+      this.load.image(frame.key, frame.path);
+    }
+
     for (const pose of allPoseAssets()) {
       this.loadPoseAsset(pose);
     }
@@ -158,7 +192,9 @@ export class BattleScene extends Phaser.Scene {
       this.load.audio(key, path);
     }
 
-    this.load.audio(menuMusicManifest.key, menuMusicManifest.path);
+    for (const track of menuMusicTrackManifests) {
+      this.load.audio(track.key, track.path);
+    }
 
     for (const sfx of [...sfxEntries, ...allExtraSfxAssets()]) {
       this.load.audio(sfx.key, sfx.path);
@@ -167,24 +203,32 @@ export class BattleScene extends Phaser.Scene {
 
   create() {
     this.ensureFallbackTextures();
+    this.preloadUiFonts();
     this.createVfxAnimations();
     this.createBackground();
     this.createFloorMarks();
     this.keys = createKeyboardBindings(this);
     this.menuKeys = this.createMenuKeys();
+    this.selectedMusicKey = this.loadSavedMusicKey();
     this.ui = new DomUi(
       {
         chooseMode: (mode) => this.enterCharacterSelect(mode),
         previewSelection: () => undefined,
         startMatch: (selection) => this.startMatch(selection, true),
+        changeMusic: (delta) => this.changeMusicSelection(delta),
+        openSettings: () => this.openSettingsMenu(),
+        closeSettings: () => this.closeSettingsMenu(),
         pauseAction: (action) => this.applyPauseAction(action),
         restartMatch: () => this.startMatch(this.lastSelection, true),
         mainMenu: () => this.enterMainMenu(),
       },
       fighterManifests,
       stageManifests,
+      musicChoices,
     );
+    this.ui.updateMusicChoice(this.selectedMusicKey);
     this.enterMainMenu();
+    document.getElementById("loading-screen")?.classList.add("hidden");
   }
 
   update(_time: number, deltaMs: number) {
@@ -223,26 +267,31 @@ export class BattleScene extends Phaser.Scene {
   private enterMainMenu() {
     this.stopRoundAdvance();
     this.cancelSelectionConfirm();
+    this.cleanupMenuLightning();
     this.stopTransientSfx();
     this.sim?.cancelSpecialSequence();
     this.cleanupSpecialEffects();
     this.resetMatch();
+    this.settingsOpen = false;
     this.screen = "title";
     this.sim = null;
     this.destroyFighterViews();
     this.setStage(this.lastSelection.stageKey);
     this.playMenuMusic();
     this.ui.showMainMenu();
+    this.startMenuLightning();
     this.ui.updateHud(null, this.score);
   }
 
   private enterCharacterSelect(mode: GameMode) {
     this.stopRoundAdvance();
     this.cancelSelectionConfirm();
+    this.cleanupMenuLightning();
     this.stopTransientSfx();
     this.sim?.cancelSpecialSequence();
     this.cleanupSpecialEffects();
     this.resetMatch();
+    this.settingsOpen = false;
     this.screen = "characters";
     this.sim = null;
     this.destroyFighterViews();
@@ -255,10 +304,13 @@ export class BattleScene extends Phaser.Scene {
       p2Locked: false,
     };
     this.ui.showCharacterSelect(this.selectState);
+    this.startMenuLightning();
   }
 
   private enterStageSelect() {
     this.cancelSelectionConfirm();
+    this.cleanupMenuLightning();
+    this.settingsOpen = false;
     this.sim?.cancelSpecialSequence();
     this.cleanupSpecialEffects();
     this.screen = "stage";
@@ -267,12 +319,13 @@ export class BattleScene extends Phaser.Scene {
     this.stageIndex = this.findStageIndex(this.lastSelection.stageKey);
     this.setStage(this.lastSelection.stageKey);
     this.ui.showStageSelect(this.lastSelection);
+    this.startMenuLightning();
   }
 
   private startMatch(selection: RoundSelection, resetScore: boolean) {
     this.hasStarted = true;
-    this.lastSelection = selection;
-    this.stageIndex = this.findStageIndex(selection.stageKey);
+    this.lastSelection = this.normalizeSelection(selection);
+    this.stageIndex = this.findStageIndex(this.lastSelection.stageKey);
     if (resetScore) {
       this.resetMatch();
     }
@@ -283,14 +336,16 @@ export class BattleScene extends Phaser.Scene {
     this.stopRoundAdvance();
     this.sim?.cancelSpecialSequence();
     this.cleanupSpecialEffects();
+    this.cleanupMenuLightning();
     this.screen = "playing";
+    this.settingsOpen = false;
     this.roundEndHandled = false;
     this.roundOverPlayed = false;
     this.stopTransientSfx();
     this.resetVoicePolicy();
     this.stopMenuMusic();
     this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
-    this.playSfx(sfxManifest.roundStart.key, "roundStart");
+    this.playRoundAnnouncementSfx();
     this.ui.hideRoundMessage();
     this.ui.hidePauseMenu();
     this.ui.showGameplay();
@@ -334,6 +389,13 @@ export class BattleScene extends Phaser.Scene {
         if (winner !== "draw") {
           const loser = winner === "p1" ? this.sim?.snapshot.fighters.p2 : this.sim?.snapshot.fighters.p1;
           if (loser) {
+            if (loser.health <= 0) {
+              this.playSfx(sfxManifest.ko.key, "ko", {
+                oneShot: true,
+                cooldownMs: maxRoundOverPauseMs,
+                volumeMultiplier: 1.15,
+              });
+            }
             this.playKoVoice(loser);
           }
         } else {
@@ -345,12 +407,21 @@ export class BattleScene extends Phaser.Scene {
         }
         this.handleRoundEnd(winner);
       },
+    }, {
+      groundY: this.currentGroundY,
     });
 
     this.createFighterView("p1", p1Def);
     this.createFighterView("p2", p2Def);
     this.syncViews(this.sim.snapshot);
     this.ui.updateHud(this.sim.snapshot, this.score);
+    const roundNumber = this.currentRoundNumber();
+    this.ui.showRoundMessage(`ROUND ${roundNumber}`);
+    this.time.delayedCall(1150, () => {
+      if (this.screen === "playing" && !this.roundEndHandled) {
+        this.ui.hideRoundMessage();
+      }
+    });
   }
 
   private handleRoundEnd(winner: FighterId | "draw") {
@@ -386,6 +457,7 @@ export class BattleScene extends Phaser.Scene {
     this.screen = "match-over";
     this.sim.cancelSpecialSequence();
     this.cleanupSpecialEffects();
+    this.cleanupMenuLightning();
     this.sound.stopAll();
     this.clearSfxGuards();
     this.ui.hideRoundMessage();
@@ -400,6 +472,7 @@ export class BattleScene extends Phaser.Scene {
     this.pauseIndex = 0;
     this.sim.cancelSpecialSequence();
     this.cleanupSpecialEffects();
+    this.cleanupMenuLightning();
     this.sound.pauseAll();
     this.tweens.pauseAll();
     this.time.paused = true;
@@ -446,6 +519,14 @@ export class BattleScene extends Phaser.Scene {
 
   private handleScreenInput() {
     if (this.screen === "title") {
+      if (this.settingsOpen) {
+        this.handleSettingsInput();
+        return;
+      }
+      if (this.just(this.menuKeys.music)) {
+        this.openSettingsMenu();
+        return;
+      }
       if (this.just(this.keys.p1.punch)) {
         this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
         this.enterCharacterSelect("pvp");
@@ -457,11 +538,13 @@ export class BattleScene extends Phaser.Scene {
     }
 
     if (this.screen === "characters") {
+      this.settingsOpen = false;
       this.handleCharacterSelectInput();
       return;
     }
 
     if (this.screen === "stage") {
+      this.settingsOpen = false;
       this.handleStageSelectInput();
       return;
     }
@@ -509,19 +592,27 @@ export class BattleScene extends Phaser.Scene {
       }
     }
 
-    if (this.just(this.keys.p1.punch)) {
-      this.selectState.p1Locked = true;
-      if (this.selectState.mode === "pvc") {
-        this.selectState.p2Index = this.randomCpuFighterIndex(this.selectState.p1Index);
-        this.selectState.p2Locked = true;
+    if (this.just(this.keys.p1.punch) && !this.selectState.p1Locked) {
+      if (this.isPlayableFighterIndex(this.selectState.p1Index)) {
+        this.selectState.p1Locked = true;
+        if (this.selectState.mode === "pvc") {
+          this.selectState.p2Index = this.randomCpuFighterIndex(this.selectState.p1Index);
+          this.selectState.p2Locked = true;
+        }
+        this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+        changed = true;
+      } else {
+        this.playSfx(sfxManifest.block.key, "block", { cooldownMs: 180 });
       }
-      this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
-      changed = true;
     }
-    if (this.just(this.keys.p2.punch)) {
-      this.selectState.p2Locked = true;
-      this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
-      changed = true;
+    if (this.just(this.keys.p2.punch) && this.selectState.mode === "pvp" && !this.selectState.p2Locked) {
+      if (this.isPlayableFighterIndex(this.selectState.p2Index)) {
+        this.selectState.p2Locked = true;
+        this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+        changed = true;
+      } else {
+        this.playSfx(sfxManifest.block.key, "block", { cooldownMs: 180 });
+      }
     }
     if (this.just(this.keys.p1.kick)) {
       this.selectState.p1Locked = false;
@@ -620,12 +711,12 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private selectionFromSelectState(): RoundSelection {
-    return {
+    return this.normalizeSelection({
       mode: this.selectState.mode,
       p1FighterKey: fighterManifests[this.selectState.p1Index]?.key ?? fighterManifests[0].key,
       p2FighterKey: fighterManifests[this.selectState.p2Index]?.key ?? fighterManifests[0].key,
       stageKey: this.lastSelection.stageKey,
-    };
+    });
   }
 
   private resetMatch() {
@@ -680,6 +771,7 @@ export class BattleScene extends Phaser.Scene {
       enter: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.ENTER),
       escape: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.ESC),
       space: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE),
+      music: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.M),
       p1Up: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.W),
       p1Down: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.S),
       p2Up: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.UP),
@@ -687,6 +779,19 @@ export class BattleScene extends Phaser.Scene {
       p1Back: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.G),
       p2Back: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.L),
     };
+  }
+
+  private preloadUiFonts() {
+    if (!document.fonts) {
+      return;
+    }
+    void Promise.all([
+      document.fonts.load(`900 44px ${arcadeFonts.display}`),
+      document.fonts.load(`900 28px ${arcadeFonts.menu}`),
+      document.fonts.load(`900 24px ${arcadeFonts.hud}`),
+    ]).catch(() => {
+      // CSS fallback stacks keep the game readable when local font files are missing.
+    });
   }
 
   private loadPoseAsset(pose: PoseAsset) {
@@ -703,7 +808,7 @@ export class BattleScene extends Phaser.Scene {
   private ensureFallbackTextures() {
     this.createFallbackTexture("missing-stage", 960, 540, 0x1f2933, "BSU STAGE");
 
-    for (const fighter of fighterManifests) {
+    for (const fighter of fighterManifests.filter(isFighterPlayable)) {
       if (!this.textures.exists(fighter.portrait.key)) {
         const idle = fighter.poses.idle;
         if (this.textures.exists(idle.key)) {
@@ -739,6 +844,43 @@ export class BattleScene extends Phaser.Scene {
         this.createProjectileFallbackTexture(fighter.special.projectileAsset.key, fighter.special.effect);
       }
     }
+  }
+
+  private handleSettingsInput() {
+    const musicDelta =
+      (this.just(this.keys.p1.left) || this.just(this.keys.p2.left) ? -1 : 0) +
+      (this.just(this.keys.p1.right) || this.just(this.keys.p2.right) ? 1 : 0);
+    if (musicDelta !== 0) {
+      this.changeMusicSelection(musicDelta);
+      return;
+    }
+    if (
+      this.just(this.keys.p1.kick) ||
+      this.just(this.keys.p2.kick) ||
+      this.just(this.menuKeys.escape) ||
+      this.just(this.menuKeys.music)
+    ) {
+      this.closeSettingsMenu();
+    }
+  }
+
+  private openSettingsMenu() {
+    if (this.screen !== "title") {
+      return;
+    }
+    this.settingsOpen = true;
+    this.playSfx(sfxManifest.menuSelect.key, "menuSelect", { cooldownMs: 120 });
+    this.ui.showSettingsMenu();
+    this.ui.updateMusicChoice(this.selectedMusicKey);
+  }
+
+  private closeSettingsMenu() {
+    if (!this.settingsOpen) {
+      return;
+    }
+    this.settingsOpen = false;
+    this.playSfx(sfxManifest.menuSelect.key, "menuSelect", { cooldownMs: 120 });
+    this.ui.hideSettingsMenu();
   }
 
   private createVfxAnimations() {
@@ -822,6 +964,8 @@ export class BattleScene extends Phaser.Scene {
     this.background = this.add.image(480, 270, bgKey);
     this.background.setDisplaySize(960, 540);
     this.background.setDepth(-10);
+    this.background.setAlpha(stage.usesDomBackground ? 0 : 1);
+    this.applyDomStageBackground(stage);
   }
 
   private setStage(stageKey: string) {
@@ -830,10 +974,21 @@ export class BattleScene extends Phaser.Scene {
     const textureKey = this.textures.exists(stage.key) ? stage.key : "missing-stage";
     this.background?.setTexture(textureKey);
     this.background?.setDisplaySize(960, 540);
+    this.background?.setAlpha(stage.usesDomBackground ? 0 : 1);
+    this.applyDomStageBackground(stage);
+    this.currentGroundY = stage.floorY ?? 474;
+  }
+
+  private applyDomStageBackground(stage: { path: string; usesDomBackground?: boolean }) {
+    const root = document.getElementById("game-root");
+    if (!root) {
+      return;
+    }
+    root.style.backgroundImage = stage.usesDomBackground ? `url("${stage.path}")` : "";
   }
 
   private createFloorMarks() {
-    const ground = this.add.rectangle(480, 493, 840, 5, 0xf4c84a, 0.72);
+    const ground = this.add.rectangle(480, this.currentGroundY + 29, 840, 5, 0xf4c84a, 0.72);
     ground.setDepth(-1);
     this.add.rectangle(480, 510, 960, 60, 0x06080c, 0.28).setDepth(-2);
   }
@@ -863,7 +1018,7 @@ export class BattleScene extends Phaser.Scene {
     const sprite = this.add.sprite(x, y, pose.key);
     sprite.setOrigin(0.5, 1);
     sprite.setDisplaySize(def.body.drawWidth * def.scale, def.body.drawHeight * def.scale);
-    sprite.setFlipX(this.shouldFlip(def, "idle", facing));
+    sprite.setFlipX(shouldFlipFighterAsset(def, "idle", facing));
     sprite.setData("fighterView", true);
     shadow.setData("fighterView", true);
     shadow.setDepth(2);
@@ -872,6 +1027,7 @@ export class BattleScene extends Phaser.Scene {
       sprite,
       shadow,
       lastPose: null,
+      frameAnimation: { name: null, frameIndex: 0, nextFrameAtMs: 0 },
       effect: { offsetX: 0, offsetY: 0, angle: 0, scale: 1 },
     });
   }
@@ -885,21 +1041,35 @@ export class BattleScene extends Phaser.Scene {
       }
       view.sprite.setPosition(fighter.x + view.effect.offsetX, fighter.y + view.effect.offsetY);
       view.sprite.setAngle(view.effect.angle);
-      view.sprite.setFlipX(this.shouldFlip(fighter.def, fighter.pose, fighter.facing));
       view.sprite.setDisplaySize(
         fighter.def.body.drawWidth * fighter.def.scale * view.effect.scale,
         fighter.def.body.drawHeight * fighter.def.scale * view.effect.scale,
       );
-      view.shadow.setPosition(fighter.x, 472);
+      view.shadow.setPosition(fighter.x, fighter.y + 8);
       view.shadow.setScale(fighter.grounded ? 1 : 0.74);
 
-      if (view.lastPose !== fighter.pose) {
-        this.applyPose(view.sprite, fighter.def, fighter.pose);
+      const frameAnimationName = this.getFrameAnimationName(snapshot, fighter);
+      const frameAnimationApplied = frameAnimationName
+        ? this.applyFrameAnimation(view, fighter, frameAnimationName)
+        : false;
+      if (frameAnimationApplied) {
+        // Texture and flip are handled by the active frame animation.
+      } else {
+        this.stopLoopAnimation(view);
+        view.sprite.setFlipX(this.shouldFlipFighterPose(fighter, fighter.pose));
+      }
+
+      if (!frameAnimationApplied && view.lastPose !== fighter.pose) {
+        this.applyPose(view, fighter, fighter.pose);
         view.lastPose = fighter.pose;
       }
 
-      if (specialSequence.phase === "intro" && specialSequence.casterId === fighter.id) {
-        view.sprite.setTint(0xfff1a6);
+      if (
+        specialSequence.phase === "intro" &&
+        specialSequence.casterId === fighter.id &&
+        specialIntroPresentation.specialIntroTint !== null
+      ) {
+        view.sprite.setTint(specialIntroPresentation.specialIntroTint);
       } else if (fighter.hitStunMs > 0) {
         view.sprite.setTint(0xffb2a8);
       } else if (fighter.health <= 0) {
@@ -910,42 +1080,374 @@ export class BattleScene extends Phaser.Scene {
     }
   }
 
-  private applyPose(sprite: Phaser.GameObjects.Sprite, def: FighterAssetManifest, poseName: PoseName) {
-    const pose = def.poses[poseName];
+  private applyPose(view: FighterView, fighter: FighterState, poseName: PoseName) {
+    const pose = fighter.def.poses[poseName];
     if (pose.type === "spritesheet") {
       const animationKey = `${pose.key}-${poseName}`;
       if (this.anims.exists(animationKey)) {
-        sprite.play(animationKey, true);
+        view.sprite.play(animationKey, true);
+        view.sprite.setOrigin(0.5, 1);
+        view.sprite.setDisplaySize(
+          fighter.def.body.drawWidth * fighter.def.scale * view.effect.scale,
+          fighter.def.body.drawHeight * fighter.def.scale * view.effect.scale,
+        );
+        view.sprite.setFlipX(this.shouldFlipFighterPose(fighter, poseName));
         return;
       }
     }
-    sprite.stop();
-    sprite.setTexture(pose.key);
+    this.setFighterTexture(view, fighter, pose.key, this.getPoseSourceFacing(fighter, poseName), false);
   }
 
-  private shouldFlip(def: FighterAssetManifest, poseName: PoseName, facing: -1 | 1) {
-    return shouldFlipFighterAsset(def, poseName, facing);
+  private getPoseSourceFacing(fighter: FighterState, poseName: PoseName) {
+    if (poseName === "jump") {
+      return fighter.def.jumpBaseFacing ?? fighter.def.poses[poseName].sourceFacing ?? fighter.def.baseFacing;
+    }
+    return fighter.def.poses[poseName].sourceFacing ?? fighter.def.baseFacing;
+  }
+
+  private getFrameAnimationName(snapshot: RoundSnapshot, fighter: FighterState): MovementAnimationName | null {
+    if (
+      snapshot.status !== "playing" ||
+      snapshot.specialSequence.phase !== "idle" ||
+      fighter.pose !== "idle" ||
+      fighter.health <= 0 ||
+      !fighter.grounded
+    ) {
+      return null;
+    }
+
+    const animations = fighter.def.frameAnimations;
+    if (Math.abs(fighter.vx) > 16) {
+      const movementMode = fighter.def.movementAnimation ?? "walk";
+      if (movementMode === "dash") {
+        const movementDirection: -1 | 1 = fighter.vx < 0 ? -1 : 1;
+        const animationName: MovementAnimationName = movementDirection === fighter.facing ? "dash" : "backdash";
+        if (animations?.[animationName]) {
+          return animationName;
+        }
+      }
+      if (movementMode === "walk" && animations?.walk) {
+        return "walk";
+      }
+      return null;
+    }
+    if (animations?.idle) {
+      return "idle";
+    }
+    return null;
+  }
+
+  private applyFrameAnimation(view: FighterView, fighter: FighterState, animationName: MovementAnimationName) {
+    const animation = fighter.def.frameAnimations?.[animationName];
+    if (!animation || animation.frames.length === 0 || !animation.frames.every((frame) => this.textures.exists(frame.key))) {
+      return false;
+    }
+
+    const now = this.time.now;
+    if (view.frameAnimation.name !== animationName) {
+      view.frameAnimation.name = animationName;
+      view.frameAnimation.frameIndex = 0;
+      view.frameAnimation.nextFrameAtMs = now + animation.frameMs;
+    } else if (now >= view.frameAnimation.nextFrameAtMs) {
+      const elapsedFrames = Math.max(1, Math.floor((now - view.frameAnimation.nextFrameAtMs) / animation.frameMs) + 1);
+      view.frameAnimation.frameIndex = (view.frameAnimation.frameIndex + elapsedFrames) % animation.frames.length;
+      view.frameAnimation.nextFrameAtMs += elapsedFrames * animation.frameMs;
+      if (view.frameAnimation.nextFrameAtMs <= now) {
+        view.frameAnimation.nextFrameAtMs = now + animation.frameMs;
+      }
+    }
+
+    const frame = animation.frames[view.frameAnimation.frameIndex % animation.frames.length];
+    const sourceFacing = frame.sourceFacing ?? fighter.def.poses.idle.sourceFacing ?? fighter.def.baseFacing;
+    this.setFighterTexture(view, fighter, frame.key, sourceFacing, true);
+    view.lastPose = null;
+    return true;
+  }
+
+  private setFighterTexture(
+    view: FighterView,
+    fighter: FighterState,
+    textureKey: string,
+    sourceFacing: "left" | "right",
+    resetAlpha: boolean,
+  ) {
+    view.sprite.stop();
+    if (view.sprite.texture.key !== textureKey) {
+      view.sprite.setTexture(textureKey);
+    }
+    view.sprite.setOrigin(0.5, 1);
+    view.sprite.setDisplaySize(
+      fighter.def.body.drawWidth * fighter.def.scale * view.effect.scale,
+      fighter.def.body.drawHeight * fighter.def.scale * view.effect.scale,
+    );
+    const unflippedFacing = sourceFacing === "right" ? 1 : -1;
+    view.sprite.setFlipX(this.getRenderFacing(fighter) !== unflippedFacing);
+    if (resetAlpha) {
+      view.sprite.setAlpha(1);
+      view.sprite.clearTint();
+    }
+  }
+
+  private stopLoopAnimation(view: FighterView) {
+    view.frameAnimation.name = null;
+    view.frameAnimation.frameIndex = 0;
+    view.frameAnimation.nextFrameAtMs = 0;
+  }
+
+  private shouldFlipFighterPose(fighter: FighterState, poseName: PoseName) {
+    return shouldFlipFighterAsset(fighter.def, poseName, this.getRenderFacing(fighter));
+  }
+
+  private getRenderFacing(fighter: FighterState): -1 | 1 {
+    if (fighter.pose === "jump" && !fighter.grounded && Math.abs(fighter.vx) > 12) {
+      return fighter.vx < 0 ? -1 : 1;
+    }
+    return fighter.facing;
+  }
+
+  private changeMusicSelection(delta: number) {
+    const currentIndex = Math.max(0, musicChoices.findIndex((choice) => choice.key === this.selectedMusicKey));
+    const nextChoice = musicChoices[Phaser.Math.Wrap(currentIndex + delta, 0, musicChoices.length)] ?? musicChoices[0];
+    if (!nextChoice || nextChoice.key === this.selectedMusicKey) {
+      return;
+    }
+    this.selectedMusicKey = nextChoice.key;
+    this.saveMusicKey(nextChoice.key);
+    this.ui.updateMusicChoice(nextChoice.key);
+    this.playSfx(sfxManifest.menuSelect.key, "menuSelect", { cooldownMs: 80 });
+    this.playMenuMusic();
+  }
+
+  private loadSavedMusicKey() {
+    try {
+      const saved = window.localStorage.getItem(musicStorageKey);
+      const migrated = saved ? retiredMusicKeyMigration[saved] : undefined;
+      if (migrated && musicChoices.some((choice) => choice.key === migrated)) {
+        this.saveMusicKey(migrated);
+        return migrated;
+      }
+      if (saved && musicChoices.some((choice) => choice.key === saved)) {
+        return saved;
+      }
+    } catch {
+      // localStorage can be unavailable in private or restricted browser contexts.
+    }
+    return menuMusicTrackManifests.some((track) => track.key === defaultMusicKey)
+      ? defaultMusicKey
+      : menuMusicTrackManifests[0]?.key ?? noMusicKey;
+  }
+
+  private saveMusicKey(key: string) {
+    try {
+      window.localStorage.setItem(musicStorageKey, key);
+    } catch {
+      // The game still works if settings persistence is blocked.
+    }
+  }
+
+  private selectedMusicTrack() {
+    if (this.selectedMusicKey === noMusicKey) {
+      return null;
+    }
+    return menuMusicTrackManifests.find((track) => track.key === this.selectedMusicKey) ?? menuMusicTrackManifests[0] ?? null;
   }
 
   private playMenuMusic() {
-    if (!this.cache.audio.exists(menuMusicManifest.key)) {
+    const track = this.selectedMusicTrack();
+    this.ui?.updateMusicChoice(this.selectedMusicKey);
+    if (!track) {
+      this.stopMenuMusic();
       return;
     }
-    if (!this.menuMusic) {
-      this.menuMusic = this.sound.add(menuMusicManifest.key, {
-        loop: true,
-        volume: audioConfig.musicVolume,
-      });
+    if (!this.cache.audio.exists(track.key)) {
+      return;
     }
-    if (!this.menuMusic.isPlaying) {
-      this.menuMusic.play({ loop: true, volume: audioConfig.musicVolume });
+    if (this.menuMusic && this.menuMusicKey === track.key) {
+      const volumeSound = this.menuMusic as Phaser.Sound.BaseSound & {
+        setVolume?: (volume: number) => Phaser.Sound.BaseSound;
+      };
+      volumeSound.setVolume?.(audioConfig.musicVolume);
+      if (!this.menuMusic.isPlaying) {
+        this.startMenuMusicPlayback(this.menuMusic, track.key);
+      }
+      return;
     }
+
+    this.stopMenuMusic();
+    this.menuMusic = this.sound.add(track.key, { volume: audioConfig.musicVolume });
+    this.menuMusicKey = track.key;
+    this.startMenuMusicPlayback(this.menuMusic, track.key);
+  }
+
+  private startMenuMusicPlayback(music: Phaser.Sound.BaseSound, trackKey: string) {
+    const shouldLoop = menuMusicTrackManifests.length <= 1;
+    music.once("complete", () => {
+      if (this.menuMusic !== music || this.menuMusicKey !== trackKey || shouldLoop) {
+        return;
+      }
+      this.playNextMenuMusic(trackKey);
+    });
+    music.play({ loop: shouldLoop, volume: audioConfig.musicVolume });
+  }
+
+  private playNextMenuMusic(completedTrackKey: string) {
+    if (this.selectedMusicKey === noMusicKey) {
+      return;
+    }
+    const availableTracks = menuMusicTrackManifests.filter((track) => this.cache.audio.exists(track.key));
+    if (availableTracks.length <= 1) {
+      return;
+    }
+    const completedIndex = Math.max(0, availableTracks.findIndex((track) => track.key === completedTrackKey));
+    const nextTrack = availableTracks[(completedIndex + 1) % availableTracks.length];
+    if (!nextTrack || nextTrack.key === completedTrackKey) {
+      return;
+    }
+    this.selectedMusicKey = nextTrack.key;
+    this.saveMusicKey(nextTrack.key);
+    this.stopMenuMusic();
+    this.playMenuMusic();
   }
 
   private stopMenuMusic() {
     if (this.menuMusic?.isPlaying) {
       this.menuMusic.stop();
     }
+    this.menuMusic?.destroy();
+    this.menuMusic = null;
+    this.menuMusicKey = null;
+  }
+
+  private startMenuLightning() {
+    this.cleanupMenuLightning();
+    if (!menuLightningConfig.enabled || menuLightningManifests.length === 0 || !this.isLightningMenuScreen()) {
+      return;
+    }
+    this.spawnMenuLightning();
+    this.scheduleNextMenuLightning();
+  }
+
+  private scheduleNextMenuLightning() {
+    if (!this.isLightningMenuScreen()) {
+      return;
+    }
+    const delay = Phaser.Math.Between(menuLightningConfig.minDelayMs, menuLightningConfig.maxDelayMs);
+    const timer = this.time.delayedCall(delay, () => {
+      this.spawnMenuLightning();
+      this.scheduleNextMenuLightning();
+    });
+    this.menuLightningTimers.push(timer);
+  }
+
+  private spawnMenuLightning() {
+    if (!this.isLightningMenuScreen()) {
+      return;
+    }
+    if (this.screen === "characters") {
+      this.spawnCharacterPortraitLightning();
+      return;
+    }
+    const root = document.getElementById("ui-root");
+    if (!root) {
+      return;
+    }
+    const boltCount = Phaser.Math.Between(1, Math.max(1, menuLightningConfig.maxBolts));
+
+    for (let index = 0; index < boltCount; index += 1) {
+      const asset = Phaser.Utils.Array.GetRandom(menuLightningManifests);
+      const bolt = document.createElement("span");
+      const width = Phaser.Math.Between(menuLightningConfig.minWidthPx, menuLightningConfig.maxWidthPx);
+      const alpha = Phaser.Math.FloatBetween(menuLightningConfig.minAlpha, menuLightningConfig.maxAlpha);
+      const position = this.menuLightningPosition(index);
+      bolt.className = `menu-lightning-bolt ${this.screen}`;
+      bolt.style.backgroundImage = `url("${asset.path}")`;
+      bolt.style.left = `${position.x}%`;
+      bolt.style.top = `${position.y}%`;
+      bolt.style.width = `${width}px`;
+      bolt.style.setProperty("--bolt-alpha", `${alpha}`);
+      bolt.style.transform = `translate(-50%, -50%) rotate(${Phaser.Math.Between(-18, 18)}deg) scaleX(${
+        Math.random() > 0.5 ? -1 : 1
+      })`;
+      root.append(bolt);
+      this.menuLightningElements.push(bolt);
+
+      const cleanupTimer = this.time.delayedCall(menuLightningConfig.lifetimeMs, () => {
+        bolt.remove();
+        this.menuLightningElements = this.menuLightningElements.filter((element) => element !== bolt);
+      });
+      this.menuLightningTimers.push(cleanupTimer);
+    }
+  }
+
+  private spawnCharacterPortraitLightning() {
+    const previews = Array.from(document.querySelectorAll<HTMLElement>(".big-preview"));
+    if (previews.length === 0) {
+      return;
+    }
+
+    const shuffled = Phaser.Utils.Array.Shuffle([...previews]);
+    const boltCount = Phaser.Math.Between(1, Math.min(menuLightningConfig.maxBolts, shuffled.length));
+    for (let index = 0; index < boltCount; index += 1) {
+      const preview = shuffled[index];
+      if (!preview) {
+        continue;
+      }
+      const asset = Phaser.Utils.Array.GetRandom(menuLightningManifests);
+      const bolt = document.createElement("span");
+      const width = Phaser.Math.Between(260, 460);
+      const alpha = Phaser.Math.FloatBetween(0.56, 0.82);
+      bolt.className = "menu-lightning-bolt character-portrait";
+      bolt.style.backgroundImage = `url("${asset.path}")`;
+      bolt.style.left = `${Phaser.Math.Between(36, 64)}%`;
+      bolt.style.top = `${Phaser.Math.Between(28, 56)}%`;
+      bolt.style.width = `${width}px`;
+      bolt.style.setProperty("--bolt-alpha", `${alpha}`);
+      bolt.style.transform = `translate(-50%, -50%) rotate(${Phaser.Math.Between(-22, 22)}deg) scaleX(${
+        Math.random() > 0.5 ? -1 : 1
+      })`;
+      preview.append(bolt);
+      this.menuLightningElements.push(bolt);
+
+      const cleanupTimer = this.time.delayedCall(menuLightningConfig.lifetimeMs, () => {
+        bolt.remove();
+        this.menuLightningElements = this.menuLightningElements.filter((element) => element !== bolt);
+      });
+      this.menuLightningTimers.push(cleanupTimer);
+    }
+  }
+
+  private menuLightningPosition(index: number) {
+    if (this.screen === "characters") {
+      return {
+        x: index === 0 ? Phaser.Math.Between(43, 48) : Phaser.Math.Between(52, 57),
+        y: Phaser.Math.Between(30, 48),
+      };
+    }
+    if (this.screen === "stage") {
+      return {
+        x: Phaser.Math.Between(18, 82),
+        y: Phaser.Math.Between(18, 70),
+      };
+    }
+    return {
+      x: Phaser.Math.Between(14, 86),
+      y: Phaser.Math.Between(12, 78),
+    };
+  }
+
+  private cleanupMenuLightning() {
+    for (const timer of this.menuLightningTimers) {
+      timer.remove(false);
+    }
+    this.menuLightningTimers = [];
+    for (const element of this.menuLightningElements) {
+      element.remove();
+    }
+    this.menuLightningElements = [];
+  }
+
+  private isLightningMenuScreen() {
+    return this.screen === "title" || this.screen === "characters" || this.screen === "stage";
   }
 
   private trackSpecialObject<T extends Phaser.GameObjects.GameObject>(object: T): T {
@@ -1037,6 +1539,7 @@ export class BattleScene extends Phaser.Scene {
     this.cameras.main.setZoom(1);
     this.cameras.main.centerOn(480, 270);
     for (const view of this.fighterViews.values()) {
+      this.stopLoopAnimation(view);
       view.effect.offsetX = 0;
       view.effect.offsetY = 0;
       view.effect.angle = 0;
@@ -1060,7 +1563,7 @@ export class BattleScene extends Phaser.Scene {
       return;
     }
     const x = victim.x - attacker.facing * 34;
-    const y = victim.y - (attackName === "kick" ? 98 : 126);
+    const y = victim.y - (attackName === "kick" ? 98 : attackName === "punch2" ? 112 : 126);
     this.playConfiguredVfx(config, x, y, attacker.facing);
   }
 
@@ -1098,7 +1601,6 @@ export class BattleScene extends Phaser.Scene {
 
   private playSpecialCastSequence(attacker: FighterState, victim: FighterState) {
     this.cleanupSpecialEffects();
-    this.playOptionalIdjaoSpecialAudio(attacker, "special");
     this.playSpecialVoice(attacker);
     this.playSfx(sfxManifest.roundStart.key, "roundStart");
 
@@ -1110,11 +1612,19 @@ export class BattleScene extends Phaser.Scene {
       this.add
         .text(480, 130, special.name, {
           color: "#fff2a4",
-          fontFamily: "Arial",
-          fontSize: "44px",
+          fontFamily: arcadeFonts.display,
+          fontSize: "42px",
           fontStyle: "900",
           stroke: "#000000",
-          strokeThickness: 7,
+          strokeThickness: 6,
+          shadow: {
+            offsetX: 0,
+            offsetY: 4,
+            color: "#05060a",
+            blur: 6,
+            fill: true,
+            stroke: true,
+          },
         })
         .setOrigin(0.5)
         .setDepth(13),
@@ -1123,17 +1633,41 @@ export class BattleScene extends Phaser.Scene {
     const casterView = this.fighterViews.get(attacker.id);
     if (casterView) {
       casterView.sprite.setDepth(14);
-      casterView.sprite.setTint(0xfff1a6);
-      this.trackSpecialTween(
-        this.tweens.add({
-          targets: casterView.effect,
-          offsetY: -16,
-          scale: 1.22,
-          duration: SPECIAL_INTRO_PAUSE_MS,
-          ease: "Sine.easeInOut",
-          yoyo: true,
-        }),
-      );
+      if (specialIntroPresentation.specialIntroTint !== null) {
+        casterView.sprite.setTint(specialIntroPresentation.specialIntroTint);
+      }
+      if (specialIntroPresentation.specialIntroScaleEffect) {
+        this.trackSpecialTween(
+          this.tweens.add({
+            targets: casterView.effect,
+            offsetY: -8,
+            scale: 1.06,
+            duration: SPECIAL_INTRO_PAUSE_MS,
+            ease: "Sine.easeInOut",
+            yoyo: true,
+          }),
+        );
+      }
+      if (specialIntroPresentation.specialIntroGlow) {
+        const glow = this.trackSpecialObject(
+          this.add.ellipse(attacker.x, attacker.y - 92, 180, 78, 0xfff1a6, 0.18),
+        );
+        glow.setDepth(13);
+        this.trackSpecialTween(
+          this.tweens.add({
+            targets: glow,
+            alpha: 0,
+            scaleX: 1.22,
+            scaleY: 1.28,
+            duration: SPECIAL_INTRO_PAUSE_MS,
+            ease: "Sine.easeOut",
+            onComplete: () => glow.destroy(),
+          }),
+        );
+      }
+      if (specialIntroPresentation.specialIntroFlash) {
+        this.cameras.main.flash(120, 255, 245, 190, false);
+      }
     }
 
     this.trackSpecialTween(
@@ -1243,7 +1777,7 @@ export class BattleScene extends Phaser.Scene {
     const sprite = this.createSpecialSprite(attacker, 260, 150);
     const startX = attacker.facing === 1 ? -150 : 1110;
     const endX = attacker.facing === 1 ? 1110 : -150;
-    sprite.setPosition(startX, 420);
+    sprite.setPosition(startX, attacker.y + 8);
     this.trackSpecialTween(this.tweens.add({
       targets: sprite,
       x: endX,
@@ -1262,6 +1796,7 @@ export class BattleScene extends Phaser.Scene {
     const frames = attacker.def.special.frameAssets ?? [];
     const frameDurations = this.getSpecialFrameDurations(attacker);
     const isCarRush = attacker.def.special.effect === "car-rush";
+    const isSuperFlight = attacker.def.special.effect === "super-flight";
     const isStationaryCaster =
       attacker.def.special.effect === "mango-projectile" || attacker.def.special.effect === "satellite-strike";
     const startX = isCarRush
@@ -1269,10 +1804,12 @@ export class BattleScene extends Phaser.Scene {
       : attacker.x + (isStationaryCaster ? 0 : attacker.facing * 24);
     const endX = isCarRush
       ? (attacker.facing === 1 ? 1130 : -170)
-      : isStationaryCaster
+      : isSuperFlight
+        ? Phaser.Math.Clamp(attacker.x + attacker.facing * attacker.def.special.range, 80, 880)
+        : isStationaryCaster
         ? startX
         : Phaser.Math.Clamp(victim.x - attacker.facing * 36, 80, 880);
-    const y = isCarRush ? 414 : attacker.y;
+    const y = isCarRush ? attacker.y + 8 : attacker.y;
     const width = isCarRush ? 300 : Math.max(attacker.def.body.drawWidth * 1.28, 270);
     const height = isCarRush ? 300 : Math.max(attacker.def.body.drawHeight * 1.22, 260);
     const sprite = this.trackSpecialObject(this.add.sprite(startX, y, frames[0].key));
@@ -1592,7 +2129,6 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private playSpecialImpact(attacker: FighterState, victim: FighterState) {
-    this.playOptionalIdjaoSpecialAudio(attacker, "special_hit");
     if (attacker.def.special.effect === "ground-smash" || attacker.def.special.effect === "barbell") {
       this.cameras.main.shake(240, 0.012);
     }
@@ -1657,6 +2193,26 @@ export class BattleScene extends Phaser.Scene {
     return this.lastRoundOverPauseMs;
   }
 
+  private currentRoundNumber() {
+    return Phaser.Math.Clamp(this.score.p1 + this.score.p2 + 1, 1, winsNeeded * 2 - 1);
+  }
+
+  private playRoundAnnouncementSfx() {
+    const roundNumber = this.currentRoundNumber();
+    const announcement = extraSfxManifest.roundAnnouncements[roundNumber - 1];
+    if (
+      announcement &&
+      this.playSfx(announcement.key, "roundStart", {
+        oneShot: true,
+        cooldownMs: 1200,
+        volumeMultiplier: 1.12,
+      })
+    ) {
+      return;
+    }
+    this.playSfx(sfxManifest.roundStart.key, "roundStart", { oneShot: true, cooldownMs: 1200 });
+  }
+
   private getAudioPauseMs(key: string) {
     const sound = this.sound.add(key, { volume: 0 });
     const durationMs = sound.duration > 0 ? Math.ceil(sound.duration * 1000) : fallbackRoundOverPauseMs;
@@ -1674,24 +2230,6 @@ export class BattleScene extends Phaser.Scene {
       this.sound.stopByKey(sfx.key);
     }
     this.clearSfxGuards();
-  }
-
-  private playOptionalIdjaoSpecialAudio(attacker: FighterState, fileName: "special" | "special_hit") {
-    if (attacker.def.key !== "idjao") {
-      return;
-    }
-    const audio = new Audio(`/assets/fighters/idjao/special_idjao/${fileName}.mp3`);
-    audio.volume = audioConfig.sfxVolume;
-    this.specialHtmlAudios.push(audio);
-    audio.play().catch(() => {
-      audio.remove();
-    });
-    audio.addEventListener("ended", () => {
-      audio.remove();
-    });
-    audio.addEventListener("error", () => {
-      audio.remove();
-    });
   }
 
   private resetVoicePolicy() {
@@ -1718,7 +2256,8 @@ export class BattleScene extends Phaser.Scene {
     if (this.screen === "paused" || fighter.health <= 0 || this.voicePolicy[fighter.id].koPlayed) {
       return;
     }
-    this.playFirstAvailableVoice(fighter.def.voices.special);
+    this.fadeOutSpecialActivationAudio();
+    this.playFirstAvailableSpecialVoice(fighter.def.voices.special);
   }
 
   private playHurtVoice(fighter: FighterState) {
@@ -1753,6 +2292,81 @@ export class BattleScene extends Phaser.Scene {
       if (this.playVoicePath(path)) {
         return;
       }
+    }
+  }
+
+  private playFirstAvailableSpecialVoice(paths: string[]) {
+    for (const path of paths) {
+      if (this.playSpecialVoicePath(path)) {
+        return;
+      }
+    }
+  }
+
+  private playSpecialVoicePath(path: string) {
+    const key = voiceKeyByPath.get(path);
+    if (!key || !this.cache.audio.exists(key) || this.playingVoiceKeys.has(key)) {
+      return false;
+    }
+    try {
+      const sound = this.sound.add(key, { volume: audioConfig.specialActivationVolume });
+      this.specialActivationSounds.push(sound);
+      this.playingVoiceKeys.add(key);
+      const clear = () => {
+        this.playingVoiceKeys.delete(key);
+        this.specialActivationSounds = this.specialActivationSounds.filter((candidate) => candidate !== sound);
+        sound.destroy();
+      };
+      sound.once("complete", clear);
+      sound.once("destroy", () => {
+        this.playingVoiceKeys.delete(key);
+        this.specialActivationSounds = this.specialActivationSounds.filter((candidate) => candidate !== sound);
+      });
+      sound.play();
+      return true;
+    } catch {
+      this.playingVoiceKeys.delete(key);
+      return false;
+    }
+  }
+
+  private fadeOutSpecialActivationAudio(fadeMs = 220) {
+    const sounds = [...this.specialActivationSounds];
+    this.specialActivationSounds = [];
+    for (const sound of sounds) {
+      this.playingVoiceKeys.delete(sound.key);
+      if (!sound.isPlaying) {
+        sound.destroy();
+        continue;
+      }
+
+      const volumeSound = sound as Phaser.Sound.BaseSound & {
+        volume?: number;
+        setVolume?: (volume: number) => Phaser.Sound.BaseSound;
+      };
+      if (!volumeSound.setVolume) {
+        sound.stop();
+        sound.destroy();
+        continue;
+      }
+
+      const target = { volume: volumeSound.volume ?? audioConfig.specialActivationVolume };
+      this.tweens.add({
+        targets: target,
+        volume: 0,
+        duration: fadeMs,
+        ease: "Sine.easeOut",
+        onUpdate: () => {
+          if (!sound.isPlaying) {
+            return;
+          }
+          volumeSound.setVolume?.(target.volume);
+        },
+        onComplete: () => {
+          sound.stop();
+          sound.destroy();
+        },
+      });
     }
   }
 
@@ -1851,8 +2465,14 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private findFighterIndex(key: string, fallback: number) {
-    const index = fighterManifests.findIndex((fighter) => fighter.key === key);
-    return index >= 0 ? index : Math.min(fallback, fighterManifests.length - 1);
+    const index = fighterManifests.findIndex((fighter) => fighter.key === key && isFighterPlayable(fighter));
+    if (index >= 0) {
+      return index;
+    }
+    const fallbackIndex = Math.min(fallback, fighterManifests.length - 1);
+    return this.isPlayableFighterIndex(fallbackIndex)
+      ? fallbackIndex
+      : Math.max(0, fighterManifests.findIndex(isFighterPlayable));
   }
 
   private findStageIndex(key: string) {
@@ -1864,14 +2484,25 @@ export class BattleScene extends Phaser.Scene {
     return Phaser.Math.Wrap(index, 0, fighterManifests.length);
   }
 
+  private isPlayableFighterIndex(index: number) {
+    const fighter = fighterManifests[index];
+    return fighter ? isFighterPlayable(fighter) : false;
+  }
+
+  private normalizeSelection(selection: RoundSelection): RoundSelection {
+    const fallback = fighterManifests.find(isFighterPlayable) ?? fighterManifests[0];
+    return {
+      ...selection,
+      p1FighterKey: getFighterManifest(selection.p1FighterKey).key ?? fallback.key,
+      p2FighterKey: getFighterManifest(selection.p2FighterKey).key ?? fallback.key,
+    };
+  }
+
   private randomCpuFighterIndex(excludedIndex: number) {
-    if (fighterManifests.length <= 1) {
-      return 0;
-    }
     const options = fighterManifests
       .map((_fighter, index) => index)
-      .filter((index) => index !== excludedIndex);
-    return Phaser.Utils.Array.GetRandom(options);
+      .filter((index) => index !== excludedIndex && this.isPlayableFighterIndex(index));
+    return Phaser.Utils.Array.GetRandom(options) ?? Math.max(0, fighterManifests.findIndex(isFighterPlayable));
   }
 
   private just(key: Phaser.Input.Keyboard.Key) {

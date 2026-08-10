@@ -4,24 +4,33 @@ import type { AttackName } from "../config/attacks";
 import {
   SPECIAL_ANIMATION_FRAME_RATE,
   SPECIAL_DAMAGE,
+  SPECIAL_BLOCK_DAMAGE,
+  SPECIAL_BLOCK_STUN_MS,
+  SPECIAL_HIT_STUN_MS,
+  SPECIAL_METER_BLOCK_TAKE_GAIN,
+  SPECIAL_METER_BLOCKED_DEAL_GAIN,
   SPECIAL_INTRO_PAUSE_MS,
   SPECIAL_METER_DEAL_GAIN,
   SPECIAL_METER_MAX,
   SPECIAL_METER_TAKE_GAIN,
   SPECIAL_METER_TIME_GAIN_PER_SECOND,
   SPECIAL_RECOVERY_MS,
+  HIT_STUN_REHIT_REDUCTION,
+  HIT_STUN_REHIT_THRESHOLD_MS,
+  PUNCH2_COMBO_WINDOW_MS,
   attacks,
 } from "../config/attacks";
 import type { PlayerInput } from "../input/bindings";
 import { emptyInput } from "../input/bindings";
 import type { FighterId, FighterState, GameMode, RoundSnapshot, SpecialSequenceState } from "./types";
 
-const groundY = 464;
+const defaultGroundY = 474;
 const stageLeft = 72;
 const stageRight = 888;
 const gravity = 1850;
 const jumpVelocity = -720;
 const moveSpeed = 270;
+const blockMoveMultiplier = 0.42;
 const friction = 0.78;
 const maxHealth = 200;
 const roundLengthMs = 120_000;
@@ -37,15 +46,22 @@ export type RoundEvents = {
   onKo?: (winner: FighterId | "draw") => void;
 };
 
+export type RoundOptions = {
+  groundY?: number;
+};
+
 export class RoundSimulation {
   private snapshotValue: RoundSnapshot;
+  private readonly groundY: number;
 
   constructor(
     mode: GameMode,
     p1Def: FighterAssetManifest,
     p2Def: FighterAssetManifest,
     private readonly events: RoundEvents = {},
+    options: RoundOptions = {},
   ) {
+    this.groundY = options.groundY ?? defaultGroundY;
     this.snapshotValue = {
       mode,
       status: "playing",
@@ -124,7 +140,7 @@ export class RoundSimulation {
       id,
       def,
       x,
-      y: groundY,
+      y: this.groundY,
       vx: 0,
       vy: 0,
       facing,
@@ -136,6 +152,7 @@ export class RoundSimulation {
       blocking: false,
       attackCooldowns: {
         punch: 0,
+        punch2: 0,
         kick: 0,
       },
       activeAttack: null,
@@ -146,6 +163,7 @@ export class RoundSimulation {
   private updateFighter(fighter: FighterState, input: PlayerInput, dt: number, dtMs: number) {
     fighter.hitStunMs = Math.max(0, fighter.hitStunMs - dtMs);
     fighter.attackCooldowns.punch = Math.max(0, fighter.attackCooldowns.punch - dtMs);
+    fighter.attackCooldowns.punch2 = Math.max(0, fighter.attackCooldowns.punch2 - dtMs);
     fighter.attackCooldowns.kick = Math.max(0, fighter.attackCooldowns.kick - dtMs);
 
     if (fighter.health > 0) {
@@ -163,16 +181,17 @@ export class RoundSimulation {
       }
     }
 
+    if (input.punch && this.canComboIntoPunch2(fighter)) {
+      this.startAttack(fighter, "punch2");
+    }
+
     const lockedByAction = fighter.activeAttack !== null;
     const canMove = fighter.hitStunMs <= 0 && !lockedByAction;
-    fighter.blocking =
-      canMove &&
-      fighter.grounded &&
-      ((fighter.facing === 1 && input.left) || (fighter.facing === -1 && input.right));
+    fighter.blocking = canMove && fighter.grounded && input.block;
 
     if (canMove) {
       const horizontal = (input.right ? 1 : 0) - (input.left ? 1 : 0);
-      fighter.vx = fighter.blocking ? horizontal * moveSpeed * 0.42 : horizontal * moveSpeed;
+      fighter.vx = fighter.blocking ? horizontal * moveSpeed * blockMoveMultiplier : horizontal * moveSpeed;
 
       if (input.jump && fighter.grounded) {
         fighter.vy = jumpVelocity;
@@ -181,6 +200,8 @@ export class RoundSimulation {
 
       if (input.punch) {
         this.tryStartAttack(fighter, "punch");
+      } else if (input.punch2) {
+        this.tryStartAttack(fighter, "punch2");
       } else if (input.kick) {
         this.tryStartAttack(fighter, "kick");
       } else if (input.special) {
@@ -194,8 +215,8 @@ export class RoundSimulation {
     fighter.x = Phaser.Math.Clamp(fighter.x + fighter.vx * dt, stageLeft, stageRight);
     fighter.y += fighter.vy * dt;
 
-    if (fighter.y >= groundY) {
-      fighter.y = groundY;
+    if (fighter.y >= this.groundY) {
+      fighter.y = this.groundY;
       fighter.vy = 0;
       fighter.grounded = true;
     }
@@ -211,6 +232,10 @@ export class RoundSimulation {
       return;
     }
 
+    this.startAttack(fighter, attackName);
+  }
+
+  private startAttack(fighter: FighterState, attackName: AttackName) {
     fighter.activeAttack = {
       config: attacks[attackName],
       elapsedMs: 0,
@@ -219,6 +244,24 @@ export class RoundSimulation {
     fighter.attackCooldowns[attackName] = attacks[attackName].cooldownMs;
     fighter.pose = attackName;
     this.events.onAttack?.(fighter, attackName);
+  }
+
+  private canComboIntoPunch2(fighter: FighterState) {
+    const activeAttack = fighter.activeAttack;
+    if (
+      !activeAttack ||
+      activeAttack.config.name !== "punch" ||
+      fighter.attackCooldowns.punch2 > 0 ||
+      this.snapshotValue.specialSequence.phase !== "idle" ||
+      fighter.hitStunMs > 0 ||
+      fighter.blocking ||
+      fighter.health <= 0
+    ) {
+      return false;
+    }
+
+    const activeEndMs = activeAttack.config.startupMs + activeAttack.config.activeMs;
+    return activeAttack.elapsedMs <= PUNCH2_COMBO_WINDOW_MS && activeAttack.elapsedMs <= activeEndMs;
   }
 
   private tryStartSpecial(fighter: FighterState) {
@@ -329,8 +372,18 @@ export class RoundSimulation {
       return;
     }
 
+    if (victim.blocking && victim.grounded && victim.facing === -attacker.facing) {
+      victim.health = Math.max(0, victim.health - SPECIAL_BLOCK_DAMAGE);
+      victim.specialMeter = Math.min(SPECIAL_METER_MAX, victim.specialMeter + SPECIAL_METER_BLOCK_TAKE_GAIN);
+      victim.hitStunMs = this.nextHitStun(victim, SPECIAL_BLOCK_STUN_MS);
+      victim.vx = attacker.facing * (special.knockback * blockMoveMultiplier);
+      victim.pose = victim.health <= 0 ? "ko" : "block";
+      this.events.onBlock?.(attacker, victim, "kick");
+      return;
+    }
+
     victim.health = Math.max(0, victim.health - SPECIAL_DAMAGE);
-    victim.hitStunMs = 420;
+    victim.hitStunMs = this.nextHitStun(victim, SPECIAL_HIT_STUN_MS);
     victim.vx = attacker.facing * special.knockback;
     victim.vy = special.effect === "ground-smash" ? -250 : victim.vy;
     victim.pose = victim.health <= 0 ? "ko" : "hurt";
@@ -400,9 +453,12 @@ export class RoundSimulation {
     attacker.activeAttack.hasHit = true;
 
     if (victim.blocking && victim.grounded && victim.facing === -attacker.facing) {
-      victim.hitStunMs = 120;
+      victim.health = Math.max(0, victim.health - config.blockDamage);
+      attacker.specialMeter = Math.min(SPECIAL_METER_MAX, attacker.specialMeter + Math.max(1, SPECIAL_METER_BLOCKED_DEAL_GAIN * 0.5));
+      victim.specialMeter = Math.min(SPECIAL_METER_MAX, victim.specialMeter + Math.max(1, SPECIAL_METER_BLOCK_TAKE_GAIN * 0.5));
+      victim.hitStunMs = this.nextHitStun(victim, config.blockStunMs);
       victim.vx = attacker.facing * (config.knockback * 0.42);
-      victim.pose = "block";
+      victim.pose = victim.health <= 0 ? "ko" : "block";
       this.events.onBlock?.(attacker, victim, config.name);
       return;
     }
@@ -410,10 +466,17 @@ export class RoundSimulation {
     victim.health = Math.max(0, victim.health - config.damage);
     attacker.specialMeter = Math.min(SPECIAL_METER_MAX, attacker.specialMeter + SPECIAL_METER_DEAL_GAIN);
     victim.specialMeter = Math.min(SPECIAL_METER_MAX, victim.specialMeter + SPECIAL_METER_TAKE_GAIN);
-    victim.hitStunMs = 260;
+    victim.hitStunMs = this.nextHitStun(victim, config.hitStunMs);
     victim.vx = attacker.facing * config.knockback;
     victim.pose = victim.health <= 0 ? "ko" : "hurt";
     this.events.onHit?.(attacker, victim, config.name);
+  }
+
+  private nextHitStun(victim: FighterState, baseMs: number) {
+    if (victim.hitStunMs > HIT_STUN_REHIT_THRESHOLD_MS) {
+      return Math.max(victim.hitStunMs, Math.round(baseMs * HIT_STUN_REHIT_REDUCTION));
+    }
+    return baseMs;
   }
 
   private updatePoses() {
@@ -429,6 +492,8 @@ export class RoundSimulation {
         fighter.pose = "hurt";
       } else if (fighter.activeAttack) {
         fighter.pose = fighter.activeAttack.config.name;
+      } else if (!fighter.grounded) {
+        fighter.pose = "jump";
       } else {
         fighter.pose = "idle";
       }

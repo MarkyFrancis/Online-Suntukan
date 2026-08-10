@@ -11,10 +11,11 @@ const config: Phaser.Types.Core.GameConfig = {
   parent: "game-root",
   width: 960,
   height: 540,
-  backgroundColor: "#151515",
+  backgroundColor: "rgba(0, 0, 0, 0)",
+  transparent: true,
   pixelArt: false,
   scale: {
-    mode: Phaser.Scale.FIT,
+    mode: Phaser.Scale.ENVELOP,
     autoCenter: Phaser.Scale.CENTER_BOTH,
   },
   scene: [BattleScene],

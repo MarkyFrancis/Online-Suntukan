@@ -17,6 +17,11 @@ export class FighterAi {
   decide(dtMs: number, ai: FighterState, target: FighterState): PlayerInput {
     this.elapsedSinceDecision += dtMs;
 
+    if (ai.health <= 0 || ai.hitStunMs > 0 || ai.activeAttack) {
+      this.currentInput = emptyInput();
+      return this.currentInput;
+    }
+
     if (this.elapsedSinceDecision < this.difficulty.reactionTimeMs) {
       return this.currentInput;
     }
@@ -35,14 +40,37 @@ export class FighterAi {
       next.left = targetIsRight;
       next.right = !targetIsRight;
     } else if (
+      distance <= this.difficulty.attackRange + 36 &&
+      target.activeAttack &&
+      target.activeAttack.elapsedMs < target.activeAttack.config.startupMs + target.activeAttack.config.activeMs &&
+      Math.random() < this.difficulty.blockChance
+    ) {
+      next.block = true;
+    } else if (
+      target.activeAttack &&
+      target.activeAttack.elapsedMs >= target.activeAttack.config.startupMs + target.activeAttack.config.activeMs &&
+      distance <= this.difficulty.attackRange + 30 &&
+      Math.random() < this.difficulty.punishChance
+    ) {
+      if (distance <= this.difficulty.attackRange * 0.62 && Math.random() < 0.52) {
+        next.punch = true;
+      } else if (Math.random() < 0.46) {
+        next.punch2 = true;
+      } else {
+        next.kick = true;
+      }
+    } else if (
       ai.specialMeter >= 100 &&
       distance <= Math.max(this.difficulty.specialRange, ai.def.special.range) &&
       Math.random() < this.difficulty.specialChance
     ) {
       next.special = true;
     } else if (distance <= this.difficulty.attackRange && Math.random() < this.difficulty.attackChance) {
-      if (Math.random() < 0.56) {
+      const roll = Math.random();
+      if (roll < 0.5) {
         next.punch = true;
+      } else if (roll < 0.74) {
+        next.punch2 = true;
       } else {
         next.kick = true;
       }
