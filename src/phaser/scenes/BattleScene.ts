@@ -2,7 +2,6 @@ import Phaser from "phaser";
 import {
   allFrameAnimationAssets,
   allExtraSfxAssets,
-  allPortraitAssets,
   allPoseAssets,
   allSpecialAssets,
   allThrowAssets,
@@ -203,14 +202,7 @@ export class BattleScene extends Phaser.Scene {
     this.selectedMusicKey = this.loadSavedMusicKey();
     const defaultStage = getStageManifest(stageManifests[0]?.key ?? "");
     this.queueImageFile(defaultStage.key, defaultStage.path);
-    for (const portrait of allPortraitAssets()) {
-      this.queueImageFile(portrait.key, portrait.path);
-    }
     this.queueAudioFile(sfxManifest.menuSelect.key, sfxManifest.menuSelect.path);
-    const track = this.selectedMusicTrack();
-    if (track) {
-      this.queueAudioFile(track.key, track.path);
-    }
   }
 
   create() {
@@ -2104,10 +2096,8 @@ export class BattleScene extends Phaser.Scene {
     }
     if (!this.cache.audio.exists(track.key)) {
       this.stopMenuMusic();
-      this.showLoadingScreen("Loading music...", 0);
       void this.ensureMusicTrackLoaded(track).then(() => {
         if (this.selectedMusicKey === track.key && this.screen !== "playing" && this.screen !== "paused") {
-          this.hideLoadingScreen();
           this.playMenuMusic();
         }
       });

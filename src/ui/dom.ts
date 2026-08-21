@@ -147,6 +147,7 @@ export class DomUi {
 
   showCharacterSelect(snapshot: SelectSnapshot) {
     this.showOnly("characters");
+    this.loadFighterPortraitImages();
     this.updateCharacterSelect(snapshot);
   }
 
@@ -319,7 +320,7 @@ export class DomUi {
       img.loading = "lazy";
       img.decoding = "async";
       if (fighter.portrait.path) {
-        img.src = fighter.portrait.path;
+        img.dataset.src = fighter.portrait.path;
         img.onerror = () => {
           img.removeAttribute("src");
           img.classList.add("missing-portrait");
@@ -336,6 +337,14 @@ export class DomUi {
         button.append(status);
       }
       this.elements.fighterGrid.append(button);
+    }
+  }
+
+  private loadFighterPortraitImages() {
+    for (const image of this.elements.fighterGrid.querySelectorAll<HTMLImageElement>("img[data-src]")) {
+      if (!image.getAttribute("src")) {
+        image.src = image.dataset.src ?? "";
+      }
     }
   }
 
