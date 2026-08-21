@@ -610,6 +610,32 @@ body:not([data-screen="gameplay"]) .hud {
   text-transform: uppercase;
 }
 
+.loading-progress {
+  width: min(440px, 76vw);
+  height: 14px;
+  padding: 3px;
+  border: 2px solid rgba(80, 243, 255, 0.9);
+  background: rgba(2, 4, 9, 0.78);
+  box-shadow: 0 0 18px rgba(80, 243, 255, 0.28);
+}
+
+.loading-progress span {
+  display: block;
+  width: 0%;
+  height: 100%;
+  background: linear-gradient(90deg, #50f3ff, #f4c84a, #ff4dc4);
+  transition: width 120ms ease-out;
+}
+
+.loading-mark small {
+  min-height: 1.2em;
+  color: rgba(247, 249, 255, 0.82);
+  font-family: var(--font-readable);
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
 .title-screen h1 {
   margin: 0;
   display: flex;

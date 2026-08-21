@@ -176,7 +176,7 @@ try {
 
   await waitForScreen("title", 12000);
 
-  async function waitForRefereeSign(timeoutMs = 8000) {
+  async function waitForRefereeSign(timeoutMs = 30000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const state = await evaluate(`(() => {
@@ -231,7 +231,7 @@ try {
     };
   })()`);
 
-  const visualThrow = await evaluate(`(() => {
+  const visualThrow = await evaluate(`(async () => {
     const scene = window.__bsuFighterGame?.scene?.getScene("BattleScene");
     scene.startMatch({ mode: "pvp", p1FighterKey: "karlo", p2FighterKey: "karlo", stageKey: "bsu-cartoon" }, true);
     const sim = scene.sim;
@@ -280,7 +280,7 @@ try {
   const screenshot = await client.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });
   writeFileSync(screenshotPath, Buffer.from(screenshot.data, "base64"));
 
-  const report = await evaluate(`(() => {
+  const report = await evaluate(`(async () => {
     const scene = window.__bsuFighterGame?.scene?.getScene("BattleScene");
     const empty = () => ({ left: false, right: false, jump: false, punch: false, punch2: false, kick: false, throw: false, special: false, block: false });
     const snapshot = () => scene.sim.snapshot;
@@ -290,8 +290,13 @@ try {
       }
       scene.syncViews(scene.sim.snapshot);
     };
-    const fresh = (p1FighterKey = "karlo", p2FighterKey = "karlo", mode = "pvp") => {
+    const fresh = async (p1FighterKey = "karlo", p2FighterKey = "karlo", mode = "pvp") => {
       scene.startMatch({ mode, p1FighterKey, p2FighterKey, stageKey: "bsu-cartoon" }, true);
+      const deadline = Date.now() + 30000;
+      while (scene.matchAssetLoadInProgress && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
       return snapshot();
     };
     const refereeRoundNumbers = [0, 1, 2, 3, 4].map((completedRounds) => {
@@ -323,7 +328,7 @@ try {
     };
     const completeThrow = () => tick(1950);
 
-    fresh();
+    await fresh();
     const motionFighters = position(430, 530);
     const defenderStartX = motionFighters.p2.x;
     tick(16, { ...empty(), throw: true });
@@ -370,7 +375,7 @@ try {
     };
     const throwMotion = { defenderStartX, pull, lift, slam, slideStart, slideMid, slideEnd };
 
-    fresh();
+    await fresh();
     const koFighters = position(430, 530);
     koFighters.p2.health = 18;
     tick(16, { ...empty(), throw: true });
@@ -383,8 +388,8 @@ try {
     };
 
     const originalPlaySfx = scene.playSfx;
-    const recordAttackSfx = (p1Input, p2Input, durationMs) => {
-      fresh();
+    const recordAttackSfx = async (p1Input, p2Input, durationMs) => {
+      await fresh();
       position(430, 530);
       const played = [];
       scene.playSfx = (key) => {
@@ -397,12 +402,12 @@ try {
       return played;
     };
     const basicAttackSfx = {
-      punch: recordAttackSfx({ ...empty(), punch: true }, empty(), 140),
-      kick: recordAttackSfx({ ...empty(), kick: true }, empty(), 240),
-      block: recordAttackSfx({ ...empty(), punch: true }, { ...empty(), block: true }, 140),
+      punch: await recordAttackSfx({ ...empty(), punch: true }, empty(), 140),
+      kick: await recordAttackSfx({ ...empty(), kick: true }, empty(), 240),
+      block: await recordAttackSfx({ ...empty(), punch: true }, { ...empty(), block: true }, 140),
     };
 
-    let state = fresh();
+    let state = await fresh();
     let fighters = position(430, 530);
     tick(16, { ...empty(), throw: true });
     const grabbedTexture = scene.fighterViews.get("p2")?.sprite.texture.key;
@@ -413,7 +418,7 @@ try {
     tick(250);
     const recoveryTexture = scene.fighterViews.get("p2")?.sprite.texture.key;
 
-    state = fresh();
+    state = await fresh();
     fighters = position(430, 530);
     const p1Before = fighters.p2.health;
     tick(16, { ...empty(), throw: true });
@@ -423,7 +428,7 @@ try {
     tick(900);
     const p1Damage = p1Before - snapshot().fighters.p2.health;
 
-    state = fresh();
+    state = await fresh();
     fighters = position(430, 530);
     const p2Before = fighters.p1.health;
     tick(16, empty(), { ...empty(), throw: true });
@@ -431,7 +436,7 @@ try {
     completeThrow();
     const p2Damage = p2Before - snapshot().fighters.p1.health;
 
-    state = fresh();
+    state = await fresh();
     fighters = position(240, 720);
     const whiffBefore = fighters.p2.health;
     tick(16, { ...empty(), throw: true });
@@ -439,7 +444,7 @@ try {
     completeThrow();
     const whiffDamage = whiffBefore - snapshot().fighters.p2.health;
 
-    state = fresh();
+    state = await fresh();
     fighters = position(430, 530);
     fighters.p2.blocking = true;
     const blockBefore = fighters.p2.health;
@@ -448,7 +453,7 @@ try {
     completeThrow();
     const blockDamage = blockBefore - snapshot().fighters.p2.health;
 
-    state = fresh();
+    state = await fresh();
     fighters = position(430, 530);
     fighters.p2.grounded = false;
     fighters.p2.y -= 80;
@@ -458,7 +463,7 @@ try {
     completeThrow();
     const airDamage = airBefore - snapshot().fighters.p2.health;
 
-    state = fresh();
+    state = await fresh();
     fighters = position(430, 530);
     tick(16, { ...empty(), throw: true });
     scene.sim.cancelSpecialSequence();
@@ -470,41 +475,43 @@ try {
     };
 
     const playableFighters = ["esleigue", "karlo", "idjao", "dellomas", "vince", "mark", "hernandez", "gerald"];
-    const rosterThrows = playableFighters.map((fighterKey) => {
-      fresh(fighterKey, "karlo");
+    const rosterThrows = [];
+    for (const fighterKey of playableFighters) {
+      await fresh(fighterKey, "karlo");
       const rosterFighters = position(430, 530);
       const before = rosterFighters.p2.health;
       tick(16, { ...empty(), throw: true });
       const startedPhase = snapshot().throwSequence.phase;
       const casterTexture = scene.fighterViews.get("p1")?.sprite.texture.key;
       tick(1950);
-      return {
+      rosterThrows.push({
         fighterKey,
         startedPhase,
         damage: before - snapshot().fighters.p2.health,
         completed: snapshot().throwSequence.phase === "idle",
         casterTexture,
-      };
-    });
+      });
+    }
 
-    const rosterThrowsRight = playableFighters.map((fighterKey) => {
-      fresh("karlo", fighterKey);
+    const rosterThrowsRight = [];
+    for (const fighterKey of playableFighters) {
+      await fresh("karlo", fighterKey);
       const rosterFighters = position(430, 530);
       const before = rosterFighters.p1.health;
       tick(16, empty(), { ...empty(), throw: true });
       const startedPhase = snapshot().throwSequence.phase;
       const casterTexture = scene.fighterViews.get("p2")?.sprite.texture.key;
       tick(1950);
-      return {
+      rosterThrowsRight.push({
         fighterKey,
         startedPhase,
         damage: before - snapshot().fighters.p1.health,
         completed: snapshot().throwSequence.phase === "idle",
         casterTexture,
-      };
-    });
+      });
+    }
 
-    fresh("karlo", "esleigue", "pvc");
+    await fresh("karlo", "esleigue", "pvc");
     const cpuFighters = position(430, 530);
     cpuFighters.p1.blocking = true;
     const originalRandom = Math.random;

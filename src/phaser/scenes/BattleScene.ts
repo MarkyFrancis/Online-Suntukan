@@ -7,7 +7,6 @@ import {
   allSpecialAssets,
   allThrowAssets,
   allVfxAssets,
-  allVoicePaths,
   attackVfxManifest,
   entranceVfxManifests,
   extraSfxManifest,
@@ -190,55 +189,27 @@ export class BattleScene extends Phaser.Scene {
   private spawnEntranceFallbacks: Phaser.GameObjects.GameObject[] = [];
   private spawnEntranceTimers: Phaser.Time.TimerEvent[] = [];
   private spawnEntranceTweens: Phaser.Tweens.Tween[] = [];
+  private queuedTextureKeys = new Set<string>();
+  private queuedAudioKeys = new Set<string>();
+  private matchAssetLoadInProgress = false;
+  private matchAssetLoadRunId = 0;
 
   constructor() {
     super("BattleScene");
   }
 
   preload() {
-    for (const stage of stageManifests) {
-      this.load.image(stage.key, stage.path);
-    }
-
+    this.bindLoadingProgress();
+    this.selectedMusicKey = this.loadSavedMusicKey();
+    const defaultStage = getStageManifest(stageManifests[0]?.key ?? "");
+    this.queueImageFile(defaultStage.key, defaultStage.path);
     for (const portrait of allPortraitAssets()) {
-      this.load.image(portrait.key, portrait.path);
+      this.queueImageFile(portrait.key, portrait.path);
     }
-
-    for (const frame of allFrameAnimationAssets()) {
-      this.load.image(frame.key, frame.path);
-    }
-
-    for (const throwFrame of allThrowAssets()) {
-      this.load.image(throwFrame.key, throwFrame.path);
-    }
-
-    for (const pose of allPoseAssets()) {
-      this.loadPoseAsset(pose);
-    }
-
-    for (const specialAsset of allSpecialAssets()) {
-      this.load.image(specialAsset.key, specialAsset.path);
-    }
-
-    for (const vfx of allVfxAssets()) {
-      this.load.spritesheet(vfx.key, vfx.path, {
-        frameWidth: vfx.frameWidth,
-        frameHeight: vfx.frameHeight,
-      });
-    }
-
-    for (const [index, path] of allVoicePaths().entries()) {
-      const key = `voice-${index}`;
-      voiceKeyByPath.set(path, key);
-      this.load.audio(key, path);
-    }
-
-    for (const track of menuMusicTrackManifests) {
-      this.load.audio(track.key, track.path);
-    }
-
-    for (const sfx of [...sfxEntries, ...allExtraSfxAssets()]) {
-      this.load.audio(sfx.key, sfx.path);
+    this.queueAudioFile(sfxManifest.menuSelect.key, sfxManifest.menuSelect.path);
+    const track = this.selectedMusicTrack();
+    if (track) {
+      this.queueAudioFile(track.key, track.path);
     }
   }
 
@@ -275,7 +246,7 @@ export class BattleScene extends Phaser.Scene {
     );
     this.ui.updateMusicChoice(this.selectedMusicKey);
     this.enterMainMenu();
-    document.getElementById("loading-screen")?.classList.add("hidden");
+    this.hideLoadingScreen();
   }
 
   update(_time: number, deltaMs: number) {
@@ -379,13 +350,31 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private startMatch(selection: RoundSelection, resetScore: boolean) {
+    if (this.matchAssetLoadInProgress) {
+      return;
+    }
     this.hasStarted = true;
     this.lastSelection = this.normalizeSelection(selection);
     this.stageIndex = this.findStageIndex(this.lastSelection.stageKey);
     if (resetScore) {
       this.resetMatch();
     }
-    this.startRound();
+
+    const runId = ++this.matchAssetLoadRunId;
+    this.matchAssetLoadInProgress = true;
+    this.showLoadingScreen("Loading selected fighters and stage...", 0);
+    void this.loadSelectedMatchAssets(this.lastSelection)
+      .catch(() => {
+        // Missing optional assets should never strand the match behind the loader.
+      })
+      .then(() => {
+        if (runId !== this.matchAssetLoadRunId) {
+          return;
+        }
+        this.matchAssetLoadInProgress = false;
+        this.hideLoadingScreen();
+        this.startRound();
+      });
   }
 
   private startRound() {
@@ -1343,6 +1332,198 @@ export class BattleScene extends Phaser.Scene {
     });
   }
 
+  private bindLoadingProgress() {
+    this.load.on("progress", (progress: number) => {
+      this.updateLoadingScreen(progress, "Loading menu...");
+    });
+  }
+
+  private updateLoadingScreen(progress: number, message?: string) {
+    const fill = document.getElementById("loading-progress-fill") as HTMLElement | null;
+    const label = document.getElementById("loading-progress-label");
+    if (fill) {
+      fill.style.width = `${Phaser.Math.Clamp(progress, 0, 1) * 100}%`;
+    }
+    if (label && message) {
+      label.textContent = `${message} ${Math.round(Phaser.Math.Clamp(progress, 0, 1) * 100)}%`;
+    }
+  }
+
+  private showLoadingScreen(message: string, progress = 0) {
+    document.getElementById("loading-screen")?.classList.remove("hidden");
+    this.updateLoadingScreen(progress, message);
+  }
+
+  private hideLoadingScreen() {
+    this.updateLoadingScreen(1, "Ready");
+    document.getElementById("loading-screen")?.classList.add("hidden");
+  }
+
+  private queueImageFile(key: string, path: string) {
+    if (!key || !path || this.textures.exists(key) || this.queuedTextureKeys.has(key)) {
+      return false;
+    }
+    this.queuedTextureKeys.add(key);
+    this.load.image(key, path);
+    return true;
+  }
+
+  private queuePoseFile(pose: PoseAsset) {
+    if (pose.type === "spritesheet") {
+      if (!pose.key || !pose.path || this.textures.exists(pose.key) || this.queuedTextureKeys.has(pose.key)) {
+        return false;
+      }
+      this.queuedTextureKeys.add(pose.key);
+      this.load.spritesheet(pose.key, pose.path, {
+        frameWidth: pose.frameWidth,
+        frameHeight: pose.frameHeight,
+      });
+      return true;
+    }
+    return this.queueImageFile(pose.key, pose.path);
+  }
+
+  private queueAudioFile(key: string, path: string) {
+    if (!key || !path || this.cache.audio.exists(key) || this.queuedAudioKeys.has(key)) {
+      return false;
+    }
+    this.queuedAudioKeys.add(key);
+    this.load.audio(key, path);
+    return true;
+  }
+
+  private queueVoicePath(path: string) {
+    if (!path) {
+      return false;
+    }
+    const existingKey = voiceKeyByPath.get(path);
+    if (existingKey) {
+      return false;
+    }
+    const key = `voice-${voiceKeyByPath.size}`;
+    voiceKeyByPath.set(path, key);
+    return this.queueAudioFile(key, path);
+  }
+
+  private queueFighterMatchAssets(fighter: FighterAssetManifest) {
+    let queued = false;
+    for (const pose of Object.values(fighter.poses)) {
+      queued = this.queuePoseFile(pose) || queued;
+    }
+    for (const animation of Object.values(fighter.frameAnimations ?? {})) {
+      for (const frame of animation?.frames ?? []) {
+        queued = this.queueImageFile(frame.key, frame.path) || queued;
+      }
+    }
+    for (const frame of fighter.throw?.frames ?? []) {
+      queued = this.queueImageFile(frame.key, frame.path) || queued;
+    }
+    if (fighter.throw?.fallback) {
+      queued = this.queueImageFile(fighter.throw.fallback.key, fighter.throw.fallback.path) || queued;
+    }
+    queued = this.queueImageFile(fighter.special.asset.key, fighter.special.asset.path) || queued;
+    for (const frame of fighter.special.frameAssets ?? []) {
+      queued = this.queueImageFile(frame.key, frame.path) || queued;
+    }
+    if (fighter.special.projectileAsset) {
+      queued = this.queueImageFile(fighter.special.projectileAsset.key, fighter.special.projectileAsset.path) || queued;
+    }
+    for (const path of [
+      ...fighter.voices.attack,
+      ...fighter.voices.hurt,
+      ...fighter.voices.ko,
+      ...fighter.voices.special,
+    ]) {
+      queued = this.queueVoicePath(path) || queued;
+    }
+    return queued;
+  }
+
+  private async loadSelectedMatchAssets(selection: RoundSelection) {
+    const fighters = [
+      getFighterManifest(selection.p1FighterKey),
+      getFighterManifest(selection.p2FighterKey),
+    ];
+    const stage = getStageManifest(selection.stageKey);
+    let hasQueuedFiles = false;
+
+    for (const fighter of fighters) {
+      hasQueuedFiles = this.queueFighterMatchAssets(fighter) || hasQueuedFiles;
+    }
+    if (!stage.usesDomBackground) {
+      hasQueuedFiles = this.queueImageFile(stage.key, stage.path) || hasQueuedFiles;
+    }
+    for (const sfx of [...sfxEntries, ...allExtraSfxAssets()]) {
+      hasQueuedFiles = this.queueAudioFile(sfx.key, sfx.path) || hasQueuedFiles;
+    }
+
+    const neededVfxKeys = new Set<string>(Object.values(attackVfxManifest).map((config) => config.assetKey));
+    for (const fighter of fighters) {
+      const specialVfx = specialVfxManifest[fighter.special.effect];
+      if (specialVfx) {
+        neededVfxKeys.add(specialVfx.assetKey);
+      }
+    }
+    for (const vfx of allVfxAssets()) {
+      if (!neededVfxKeys.has(vfx.key) || this.textures.exists(vfx.key) || this.queuedTextureKeys.has(vfx.key)) {
+        continue;
+      }
+      this.queuedTextureKeys.add(vfx.key);
+      this.load.spritesheet(vfx.key, vfx.path, {
+        frameWidth: vfx.frameWidth,
+        frameHeight: vfx.frameHeight,
+      });
+      hasQueuedFiles = true;
+    }
+
+    const domPaths = new Set<string>([
+      ...(stage.usesDomBackground ? [stage.path] : []),
+      refereeIntroManifest.aura.path,
+      ...refereeIntroManifest.frames.map((frame) => frame.path),
+      ...entranceVfxManifests.map((entrance) => entrance.path),
+      ...fighters.flatMap((fighter) => [fighter.special.beamAsset?.path, fighter.special.chargeAsset?.path]),
+    ].filter((path): path is string => Boolean(path)));
+    const domImagePromise = Promise.all([...domPaths].map((path) => this.waitForImage(path)));
+    await Promise.all([this.runQueuedLoader(hasQueuedFiles), domImagePromise]);
+
+    this.ensureFallbackTextures(fighters);
+    this.configureFighterTextureFiltering();
+    this.createVfxAnimations();
+  }
+
+  private runQueuedLoader(hasQueuedFiles: boolean) {
+    if (!hasQueuedFiles) {
+      this.updateLoadingScreen(1, "Ready");
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      const onProgress = (progress: number) => {
+        this.updateLoadingScreen(progress, "Loading selected fight assets...");
+      };
+      const finish = () => {
+        this.load.off("progress", onProgress);
+        this.updateLoadingScreen(1, "Fight ready");
+        resolve();
+      };
+      this.load.on("progress", onProgress);
+      this.load.once("complete", finish);
+      this.load.start();
+    });
+  }
+
+  private waitForImage(path: string) {
+    return new Promise<void>((resolve) => {
+      const image = new Image();
+      const finish = () => resolve();
+      image.onload = finish;
+      image.onerror = finish;
+      image.src = path;
+      if (image.complete) {
+        resolve();
+      }
+    });
+  }
+
   private loadPoseAsset(pose: PoseAsset) {
     if (pose.type === "spritesheet") {
       this.load.spritesheet(pose.key, pose.path, {
@@ -1354,10 +1535,10 @@ export class BattleScene extends Phaser.Scene {
     }
   }
 
-  private ensureFallbackTextures() {
+  private ensureFallbackTextures(fighters: FighterAssetManifest[] = []) {
     this.createFallbackTexture("missing-stage", 960, 540, 0x1f2933, "BSU STAGE");
 
-    for (const fighter of fighterManifests.filter(isFighterPlayable)) {
+    for (const fighter of fighters.filter(isFighterPlayable)) {
       if (!this.textures.exists(fighter.portrait.key)) {
         const idle = fighter.poses.idle;
         if (this.textures.exists(idle.key)) {
@@ -1922,6 +2103,14 @@ export class BattleScene extends Phaser.Scene {
       return;
     }
     if (!this.cache.audio.exists(track.key)) {
+      this.stopMenuMusic();
+      this.showLoadingScreen("Loading music...", 0);
+      void this.ensureMusicTrackLoaded(track).then(() => {
+        if (this.selectedMusicKey === track.key && this.screen !== "playing" && this.screen !== "paused") {
+          this.hideLoadingScreen();
+          this.playMenuMusic();
+        }
+      });
       return;
     }
     if (this.menuMusic && this.menuMusicKey === track.key) {
@@ -1956,19 +2145,30 @@ export class BattleScene extends Phaser.Scene {
     if (this.selectedMusicKey === noMusicKey) {
       return;
     }
-    const availableTracks = menuMusicTrackManifests.filter((track) => this.cache.audio.exists(track.key));
-    if (availableTracks.length <= 1) {
+    if (menuMusicTrackManifests.length <= 1) {
       return;
     }
-    const completedIndex = Math.max(0, availableTracks.findIndex((track) => track.key === completedTrackKey));
-    const nextTrack = availableTracks[(completedIndex + 1) % availableTracks.length];
+    const completedIndex = Math.max(0, menuMusicTrackManifests.findIndex((track) => track.key === completedTrackKey));
+    const nextTrack = menuMusicTrackManifests[(completedIndex + 1) % menuMusicTrackManifests.length];
     if (!nextTrack || nextTrack.key === completedTrackKey) {
       return;
     }
     this.selectedMusicKey = nextTrack.key;
     this.saveMusicKey(nextTrack.key);
     this.stopMenuMusic();
-    this.playMenuMusic();
+    void this.ensureMusicTrackLoaded(nextTrack).then(() => {
+      if (this.selectedMusicKey === nextTrack.key && this.screen !== "playing" && this.screen !== "paused") {
+        this.playMenuMusic();
+      }
+    });
+  }
+
+  private ensureMusicTrackLoaded(track: { key: string; path: string }) {
+    if (this.cache.audio.exists(track.key)) {
+      return Promise.resolve();
+    }
+    const queued = this.queueAudioFile(track.key, track.path);
+    return this.runQueuedLoader(queued);
   }
 
   private stopMenuMusic() {

@@ -185,6 +185,7 @@ export class DomUi {
 
   showStageSelect(selection: Omit<RoundSelection, "mode">) {
     this.showOnly("stage");
+    this.loadStagePreviewImages();
     this.currentSelection = {
       ...this.currentSelection,
       ...selection,
@@ -315,6 +316,8 @@ export class DomUi {
       button.setAttribute("aria-disabled", `${!playable}`);
       const img = document.createElement("img");
       img.alt = "";
+      img.loading = "lazy";
+      img.decoding = "async";
       if (fighter.portrait.path) {
         img.src = fighter.portrait.path;
         img.onerror = () => {
@@ -358,12 +361,27 @@ export class DomUi {
       button.type = "button";
       button.className = "stage-cell";
       button.dataset.index = `${index}`;
-      button.innerHTML = `<img src="${stage.path}" alt="" /><span>${stage.displayName}</span>`;
+      const img = document.createElement("img");
+      img.alt = "";
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.dataset.src = stage.path;
+      const label = document.createElement("span");
+      label.textContent = stage.displayName;
+      button.append(img, label);
       button.addEventListener("click", () => {
         this.updateStageSelect(index);
         this.callbacks.startMatch(this.currentSelection);
       });
       this.elements.stageGrid.append(button);
+    }
+  }
+
+  private loadStagePreviewImages() {
+    for (const image of this.elements.stageGrid.querySelectorAll<HTMLImageElement>("img[data-src]")) {
+      if (!image.src) {
+        image.src = image.dataset.src ?? "";
+      }
     }
   }
 
