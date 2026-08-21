@@ -21,6 +21,18 @@ export const HIT_STUN_REHIT_REDUCTION = 0.45;
 export const HIT_STUN_REHIT_THRESHOLD_MS = 90;
 export const PUNCH2_COMBO_WINDOW_MS = 350;
 
+// Throws are intentionally close-range and block-breaking, but leave a clear whiff window.
+export const THROW_RANGE = 60;
+export const THROW_DAMAGE = 18;
+export const THROW_STARTUP_MS = 180;
+export const THROW_FRAME_MS = 300;
+// Throw impact VFX overlaps the slide instead of pausing the defender in place.
+export const THROW_IMPACT_HOLD_MS = 0;
+export const THROW_RECOVERY_MS = 760;
+export const THROW_HITSTUN_MS = 650;
+export const THROW_KNOCKBACK = 230;
+export const THROW_COOLDOWN_MS = 900;
+
 export type AttackConfig = {
   name: AttackName;
   damage: number;

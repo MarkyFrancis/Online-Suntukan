@@ -5,9 +5,11 @@ import {
   allPortraitAssets,
   allPoseAssets,
   allSpecialAssets,
+  allThrowAssets,
   allVfxAssets,
   allVoicePaths,
   attackVfxManifest,
+  entranceVfxManifests,
   extraSfxManifest,
   fighterManifests,
   getFighterManifest,
@@ -16,6 +18,7 @@ import {
   isFighterPlayable,
   menuLightningManifests,
   menuMusicTrackManifests,
+  refereeIntroManifest,
   sfxManifest,
   shouldFlipFighterAsset,
   shouldFlipSpecialFrameAsset,
@@ -32,19 +35,25 @@ import {
 import { audioConfig } from "../../game/config/audio";
 import { aiDifficulty } from "../../game/config/ai";
 import { arcadeFonts } from "../../game/config/fonts";
-import { menuLightningConfig, specialIntroPresentation } from "../../game/config/presentation";
+import {
+  menuLightningConfig,
+  refereeRoundIntroPresentation,
+  spawnEntrancePresentation,
+  specialIntroPresentation,
+} from "../../game/config/presentation";
 import {
   SPECIAL_ANIMATION_FRAME_RATE,
   SPECIAL_FRAME_MS,
   SPECIAL_INTRO_PAUSE_MS,
   SPECIAL_NAME_DISPLAY_MS,
   SPECIAL_RECOVERY_MS,
+  THROW_RECOVERY_MS,
   type AttackName,
 } from "../../game/config/attacks";
 import { createKeyboardBindings, emptyInput, readInput, type KeyboardBindings } from "../../game/input/bindings";
 import { FighterAi } from "../../game/simulation/ai";
 import { RoundSimulation } from "../../game/simulation/RoundSimulation";
-import type { FighterId, FighterState, GameMode, RoundSnapshot } from "../../game/simulation/types";
+import type { FighterId, FighterState, GameMode, RoundSnapshot, ThrowSequenceState } from "../../game/simulation/types";
 import { DomUi, type MatchScore, type MusicChoice, type PauseAction, type RoundSelection, type SelectSnapshot } from "../../ui/dom";
 
 type FighterView = {
@@ -87,12 +96,27 @@ const maxRoundOverPauseMs = 8000;
 const fallbackRoundOverPauseMs = 1500;
 const noMusicKey = "none";
 const defaultMusicKey = "music-taguro-song";
+const logicalStageWidth = 960;
+const logicalStageHeight = 540;
 const musicStorageKey = "bsu-online-suntukan.music";
 const retiredMusicKeyMigration: Record<string, string> = {
   "music-ptangona-remix": "music-menu",
   "music-ptangona-remix-alt": "music-menu",
   "music-pngoa-remix": "music-menu",
 };
+
+type RefereeIntroElements = {
+  aura: Phaser.GameObjects.DOMElement;
+  referee: Phaser.GameObjects.DOMElement;
+  frame: HTMLImageElement;
+  roundSign: HTMLDivElement;
+};
+
+type SpawnEntranceElement = {
+  dom: Phaser.GameObjects.DOMElement;
+  image: HTMLImageElement;
+};
+const fighterBattleVisualScale = 1;
 const musicChoices: MusicChoice[] = [
   { key: noMusicKey, displayName: "No Music" },
   ...menuMusicTrackManifests.map((track) => ({ key: track.key, displayName: track.displayName })),
@@ -153,6 +177,19 @@ export class BattleScene extends Phaser.Scene {
   private selectionConfirmTimers: Phaser.Time.TimerEvent[] = [];
   private roundOverPlayed = false;
   private lastRoundOverPauseMs = fallbackRoundOverPauseMs;
+  private roundIntroActive = false;
+  private refereeIntroRunId = 0;
+  private refereeIntroElements: RefereeIntroElements | null = null;
+  private refereeIntroTimers: Phaser.Time.TimerEvent[] = [];
+  private refereeIntroTweens: Phaser.Tweens.Tween[] = [];
+  private refereeAuraSound: Phaser.Sound.BaseSound | null = null;
+  private spawnEntranceActive = false;
+  private spawnEntranceRunId = 0;
+  private spawnEntranceRevealed = new Set<FighterId>();
+  private spawnEntranceElements = new Map<FighterId, SpawnEntranceElement>();
+  private spawnEntranceFallbacks: Phaser.GameObjects.GameObject[] = [];
+  private spawnEntranceTimers: Phaser.Time.TimerEvent[] = [];
+  private spawnEntranceTweens: Phaser.Tweens.Tween[] = [];
 
   constructor() {
     super("BattleScene");
@@ -169,6 +206,10 @@ export class BattleScene extends Phaser.Scene {
 
     for (const frame of allFrameAnimationAssets()) {
       this.load.image(frame.key, frame.path);
+    }
+
+    for (const throwFrame of allThrowAssets()) {
+      this.load.image(throwFrame.key, throwFrame.path);
     }
 
     for (const pose of allPoseAssets()) {
@@ -202,7 +243,13 @@ export class BattleScene extends Phaser.Scene {
   }
 
   create() {
+    this.fitBattleCamera();
+    this.scale.on(Phaser.Scale.Events.RESIZE, this.fitBattleCamera, this);
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      this.scale.off(Phaser.Scale.Events.RESIZE, this.fitBattleCamera, this);
+    });
     this.ensureFallbackTextures();
+    this.configureFighterTextureFiltering();
     this.preloadUiFonts();
     this.createVfxAnimations();
     this.createBackground();
@@ -240,6 +287,12 @@ export class BattleScene extends Phaser.Scene {
       return;
     }
 
+    if (this.roundIntroActive) {
+      this.syncViews(this.sim.snapshot);
+      this.ui.updateHud(this.sim.snapshot, this.score);
+      return;
+    }
+
     const inputs =
       this.sim.snapshot.status === "playing"
         ? {
@@ -267,6 +320,7 @@ export class BattleScene extends Phaser.Scene {
   private enterMainMenu() {
     this.stopRoundAdvance();
     this.cancelSelectionConfirm();
+    this.cleanupRefereeRoundIntro();
     this.cleanupMenuLightning();
     this.stopTransientSfx();
     this.sim?.cancelSpecialSequence();
@@ -286,6 +340,7 @@ export class BattleScene extends Phaser.Scene {
   private enterCharacterSelect(mode: GameMode) {
     this.stopRoundAdvance();
     this.cancelSelectionConfirm();
+    this.cleanupRefereeRoundIntro();
     this.cleanupMenuLightning();
     this.stopTransientSfx();
     this.sim?.cancelSpecialSequence();
@@ -309,6 +364,7 @@ export class BattleScene extends Phaser.Scene {
 
   private enterStageSelect() {
     this.cancelSelectionConfirm();
+    this.cleanupRefereeRoundIntro();
     this.cleanupMenuLightning();
     this.settingsOpen = false;
     this.sim?.cancelSpecialSequence();
@@ -334,6 +390,7 @@ export class BattleScene extends Phaser.Scene {
 
   private startRound() {
     this.stopRoundAdvance();
+    this.cleanupRefereeRoundIntro();
     this.sim?.cancelSpecialSequence();
     this.cleanupSpecialEffects();
     this.cleanupMenuLightning();
@@ -345,7 +402,6 @@ export class BattleScene extends Phaser.Scene {
     this.resetVoicePolicy();
     this.stopMenuMusic();
     this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
-    this.playRoundAnnouncementSfx();
     this.ui.hideRoundMessage();
     this.ui.hidePauseMenu();
     this.ui.showGameplay();
@@ -358,7 +414,6 @@ export class BattleScene extends Phaser.Scene {
 
     this.sim = new RoundSimulation(this.lastSelection.mode, p1Def, p2Def, {
       onAttack: (fighter, attackName) => {
-        this.playSfx(sfxManifest.whoosh.key, "whoosh");
         this.playAttackVoice(fighter, attackName);
       },
       onHit: (_attacker, victim, attackName) => {
@@ -384,6 +439,24 @@ export class BattleScene extends Phaser.Scene {
       },
       onSpecialEnd: () => {
         this.cleanupSpecialEffects();
+      },
+      onThrowImpact: (attacker, victim) => {
+        this.playThrowImpactVfx(attacker, victim);
+        this.playSfx(sfxManifest.kickHit.key, "kickHit", { cooldownMs: 200 });
+        this.playHurtVoice(victim);
+        this.cameras.main.shake(150, 0.008);
+      },
+      onThrowEnd: () => {
+        for (const view of this.fighterViews.values()) {
+          view.effect.offsetX = 0;
+          view.effect.offsetY = 0;
+          view.effect.angle = 0;
+          view.effect.scale = 1;
+          view.sprite.setAngle(0);
+          view.sprite.setScale(1);
+          view.sprite.setAlpha(1);
+          view.sprite.clearTint();
+        }
       },
       onKo: (winner) => {
         if (winner !== "draw") {
@@ -415,13 +488,7 @@ export class BattleScene extends Phaser.Scene {
     this.createFighterView("p2", p2Def);
     this.syncViews(this.sim.snapshot);
     this.ui.updateHud(this.sim.snapshot, this.score);
-    const roundNumber = this.currentRoundNumber();
-    this.ui.showRoundMessage(`ROUND ${roundNumber}`);
-    this.time.delayedCall(1150, () => {
-      if (this.screen === "playing" && !this.roundEndHandled) {
-        this.ui.hideRoundMessage();
-      }
-    });
+    this.playRoundStartSequence(this.currentRoundNumber());
   }
 
   private handleRoundEnd(winner: FighterId | "draw") {
@@ -430,6 +497,7 @@ export class BattleScene extends Phaser.Scene {
     }
 
     this.roundEndHandled = true;
+    this.cleanupRefereeRoundIntro();
     this.sim.cancelSpecialSequence();
     this.cleanupSpecialEffects();
     const roundOverPauseMs = this.playRoundOverSfx();
@@ -455,6 +523,7 @@ export class BattleScene extends Phaser.Scene {
       return;
     }
     this.screen = "match-over";
+    this.cleanupRefereeRoundIntro();
     this.sim.cancelSpecialSequence();
     this.cleanupSpecialEffects();
     this.cleanupMenuLightning();
@@ -470,6 +539,7 @@ export class BattleScene extends Phaser.Scene {
     }
     this.screen = "paused";
     this.pauseIndex = 0;
+    this.cleanupRefereeRoundIntro();
     this.sim.cancelSpecialSequence();
     this.cleanupSpecialEffects();
     this.cleanupMenuLightning();
@@ -498,6 +568,7 @@ export class BattleScene extends Phaser.Scene {
 
     this.sound.stopAll();
     this.clearSfxGuards();
+    this.cleanupRefereeRoundIntro();
     this.cleanupSpecialEffects();
     this.time.paused = false;
     this.tweens.resumeAll();
@@ -740,6 +811,484 @@ export class BattleScene extends Phaser.Scene {
     this.selectionConfirming = false;
   }
 
+  private playRoundStartSequence(roundNumber: number) {
+    if (
+      spawnEntrancePresentation.enableSpawnEntrances &&
+      (spawnEntrancePresentation.playSpawnEntranceEveryRound || roundNumber === 1)
+    ) {
+      this.playSpawnEntrance(roundNumber);
+      return;
+    }
+
+    this.playRefereeRoundIntro(roundNumber);
+  }
+
+  private playSpawnEntrance(_roundNumber: number) {
+    this.cleanupRefereeRoundIntro();
+    this.roundIntroActive = true;
+    this.spawnEntranceActive = true;
+    const runId = ++this.spawnEntranceRunId;
+    this.spawnEntranceRevealed.clear();
+
+    const fighters = Object.values(this.sim?.snapshot.fighters ?? {});
+    if (fighters.length === 0) {
+      this.finishSpawnEntrance(runId);
+      return;
+    }
+
+    let firstAssetKey: string | null = null;
+    const selectedAssets = new Map<FighterId, (typeof entranceVfxManifests)[number] | null>();
+    for (const fighter of fighters) {
+      const view = this.fighterViews.get(fighter.id);
+      if (!view) {
+        continue;
+      }
+
+      view.sprite.setAlpha(0);
+      view.shadow.setAlpha(0);
+      const asset = this.chooseSpawnEntranceVfx(firstAssetKey);
+      selectedAssets.set(fighter.id, asset);
+      if (asset) {
+        firstAssetKey ??= asset.key;
+      }
+    }
+
+    const revealDelay = Math.max(0, spawnEntrancePresentation.introMs - spawnEntrancePresentation.revealMs);
+    for (const [fighterIndex, fighter] of fighters.entries()) {
+      const playerStartDelay =
+        fighterIndex * (spawnEntrancePresentation.introMs + spawnEntrancePresentation.playerIntroGapMs);
+      this.addSpawnEntranceTimer(
+        this.time.delayedCall(playerStartDelay, () => {
+          if (fighterIndex > 0) {
+            this.cleanupSpawnEntranceVisual(fighters[fighterIndex - 1]?.id);
+          }
+          const asset = selectedAssets.get(fighter.id) ?? null;
+          if (asset) {
+            this.startSpawnEntranceEffect(fighter, asset, runId);
+          } else {
+            this.createSpawnEntranceFallback(fighter, runId);
+          }
+        }),
+      );
+      this.addSpawnEntranceTimer(
+        this.time.delayedCall(playerStartDelay + revealDelay, () => {
+          this.spawnEntranceRevealed.add(fighter.id);
+          this.playSfx(extraSfxManifest.spawnEntrance.key, "roundStart", {
+            cooldownMs: 120,
+            volumeMultiplier: 1.1,
+          });
+          const entrance = this.spawnEntranceElements.get(fighter.id);
+          if (entrance) {
+            this.addSpawnEntranceTween(
+              this.tweens.add({
+                targets: entrance.dom,
+                alpha: spawnEntrancePresentation.revealEffectAlpha,
+                duration: 180,
+                ease: "Sine.easeOut",
+              }),
+            );
+          }
+          if (this.sim) {
+            this.syncViews(this.sim.snapshot);
+          }
+        }),
+      );
+    }
+    const finishDelay =
+      Math.max(0, fighters.length - 1) *
+        (spawnEntrancePresentation.introMs + spawnEntrancePresentation.playerIntroGapMs) +
+      spawnEntrancePresentation.introMs;
+    this.addSpawnEntranceTimer(
+      this.time.delayedCall(finishDelay, () => {
+        this.finishSpawnEntrance(runId);
+      }),
+    );
+  }
+
+  private chooseSpawnEntranceVfx(previousKey: string | null) {
+    const available = entranceVfxManifests.filter(
+      (asset) => spawnEntrancePresentation.allowSameEntranceVfxForBothPlayers || asset.key !== previousKey,
+    );
+    const candidates = available.length > 0 ? available : entranceVfxManifests;
+    if (candidates.length === 0) {
+      return null;
+    }
+    if (spawnEntrancePresentation.entranceVfxMode === "random") {
+      return Phaser.Utils.Array.GetRandom(candidates);
+    }
+    return candidates[0];
+  }
+
+  private startSpawnEntranceEffect(
+    fighter: FighterState,
+    asset: (typeof entranceVfxManifests)[number],
+    runId: number,
+  ) {
+    if (!this.isSpawnEntranceCurrent(runId)) {
+      return;
+    }
+    const image = document.createElement("img");
+    image.className = "spawn-entrance-vfx";
+    image.alt = "";
+    image.draggable = false;
+    image.style.width = `${asset.width}px`;
+    image.style.height = `${asset.height}px`;
+    image.style.objectFit = "contain";
+    image.style.opacity = "0.94";
+    const dom = this.add
+      .dom(fighter.x, fighter.y + 8, image)
+      .setOrigin(0.5, 1)
+      .setDepth(2)
+      .setScale(0.78);
+    this.spawnEntranceElements.set(fighter.id, { dom, image });
+    image.onerror = () => {
+      if (!this.isSpawnEntranceCurrent(runId)) {
+        return;
+      }
+      image.style.display = "none";
+      dom.setVisible(false);
+      this.createSpawnEntranceFallback(fighter, runId);
+    };
+    image.src = asset.path;
+    this.addSpawnEntranceTween(
+      this.tweens.add({
+        targets: dom,
+        scale: 1.04,
+        alpha: 1,
+        duration: spawnEntrancePresentation.introMs,
+        ease: "Sine.easeOut",
+      }),
+    );
+  }
+
+  private cleanupSpawnEntranceVisual(fighterId: FighterId | undefined) {
+    if (!fighterId) {
+      return;
+    }
+    const entrance = this.spawnEntranceElements.get(fighterId);
+    if (!entrance) {
+      return;
+    }
+    this.tweens.killTweensOf(entrance.dom);
+    entrance.dom.destroy();
+    this.spawnEntranceElements.delete(fighterId);
+  }
+
+  private createSpawnEntranceFallback(fighter: FighterState, runId: number) {
+    if (!this.isSpawnEntranceCurrent(runId)) {
+      return;
+    }
+    const flash = this.add
+      .circle(fighter.x, fighter.y - 116, 82, spawnEntrancePresentation.fallbackColor, 0.24)
+      .setDepth(2);
+    const core = this.add
+      .circle(fighter.x, fighter.y - 116, 38, 0xffffff, 0.82)
+      .setDepth(2);
+    const fallback = this.add.container(0, 0, [flash, core]).setDepth(2);
+    this.spawnEntranceFallbacks.push(fallback);
+    this.addSpawnEntranceTween(
+      this.tweens.add({
+        targets: fallback,
+        scale: 1.35,
+        alpha: 0,
+        duration: spawnEntrancePresentation.fallbackFlashMs,
+        ease: "Quad.easeOut",
+      }),
+    );
+  }
+
+  private finishSpawnEntrance(runId: number) {
+    if (!this.isSpawnEntranceCurrent(runId)) {
+      return;
+    }
+    this.cleanupSpawnEntrance();
+    if (this.sim) {
+      this.syncViews(this.sim.snapshot);
+    }
+    this.playRefereeRoundIntro(this.currentRoundNumber());
+  }
+
+  private addSpawnEntranceTimer(timer: Phaser.Time.TimerEvent) {
+    this.spawnEntranceTimers.push(timer);
+    return timer;
+  }
+
+  private addSpawnEntranceTween(tween: Phaser.Tweens.Tween) {
+    this.spawnEntranceTweens.push(tween);
+    return tween;
+  }
+
+  private isSpawnEntranceCurrent(runId: number) {
+    return this.spawnEntranceActive && this.spawnEntranceRunId === runId && this.screen === "playing" && !this.roundEndHandled;
+  }
+
+  private cleanupSpawnEntrance() {
+    this.spawnEntranceActive = false;
+    this.spawnEntranceRunId += 1;
+    this.spawnEntranceRevealed.clear();
+    for (const timer of this.spawnEntranceTimers) {
+      timer.remove(false);
+    }
+    this.spawnEntranceTimers = [];
+    for (const tween of this.spawnEntranceTweens) {
+      tween.stop();
+      tween.remove();
+    }
+    this.spawnEntranceTweens = [];
+    for (const entrance of this.spawnEntranceElements.values()) {
+      entrance.dom.destroy();
+    }
+    this.spawnEntranceElements.clear();
+    for (const fallback of this.spawnEntranceFallbacks) {
+      if (fallback.active) {
+        fallback.destroy();
+      }
+    }
+    this.spawnEntranceFallbacks = [];
+    for (const view of this.fighterViews.values()) {
+      view.sprite.setAlpha(1);
+      view.shadow.setAlpha(0.34);
+    }
+  }
+
+  private playRefereeRoundIntro(roundNumber: number) {
+    this.cleanupRefereeRoundIntro();
+    this.roundIntroActive = true;
+    const runId = ++this.refereeIntroRunId;
+    const config = refereeRoundIntroPresentation;
+
+    const auraNode = document.createElement("img");
+    auraNode.className = "referee-intro-aura";
+    auraNode.src = refereeIntroManifest.aura.path;
+    auraNode.alt = "";
+    auraNode.draggable = false;
+    auraNode.style.width = `${config.auraWidth}px`;
+    auraNode.style.height = `${Math.round(config.auraWidth * (1080 / 990))}px`;
+    auraNode.style.objectFit = "contain";
+    auraNode.style.zIndex = "1";
+
+    const refereeNode = document.createElement("div");
+    refereeNode.className = "referee-intro-sprite";
+    refereeNode.style.width = `${config.refereeWidth}px`;
+    refereeNode.style.height = `${config.refereeWidth}px`;
+    refereeNode.style.zIndex = "2";
+
+    const frameNode = document.createElement("img");
+    frameNode.className = "referee-intro-frame";
+    frameNode.src = refereeIntroManifest.frames[0]?.path ?? "";
+    frameNode.alt = "";
+    frameNode.draggable = false;
+    frameNode.style.width = "100%";
+    frameNode.style.height = "100%";
+    frameNode.style.objectFit = "contain";
+    refereeNode.append(frameNode);
+
+    const signNode = document.createElement("div");
+    signNode.className = "referee-round-sign";
+    signNode.textContent = `ROUND\n${roundNumber}`;
+    signNode.style.display = "none";
+    refereeNode.append(signNode);
+
+    const aura = this.add
+      .dom(config.stageX, config.startY + config.auraOffsetY, auraNode)
+      .setOrigin(0.5)
+      .setAlpha(config.auraAlpha);
+    const referee = this.add.dom(config.stageX, config.startY, refereeNode).setOrigin(0.5);
+
+    this.refereeIntroElements = { aura, referee, frame: frameNode, roundSign: signNode };
+    this.startRefereeAuraSound();
+
+    this.addRefereeIntroTween(
+      this.tweens.add({
+        targets: aura,
+        y: config.stageY + config.auraOffsetY,
+        duration: config.descentMs,
+        ease: "Sine.easeOut",
+      }),
+    );
+    this.addRefereeIntroTween(
+      this.tweens.add({
+        targets: referee,
+        y: config.stageY,
+        duration: config.descentMs,
+        ease: "Sine.easeOut",
+      }),
+    );
+    let elapsedMs = config.descentMs;
+    for (const [frameIndex, durationMs] of config.frameDurationsMs.entries()) {
+      this.addRefereeIntroTimer(elapsedMs, runId, () => {
+        this.setRefereeIntroFrame(frameIndex, roundNumber);
+        if (frameIndex === 3) {
+          this.playRoundAnnouncementSfx();
+        }
+      });
+      elapsedMs += durationMs;
+    }
+
+    this.addRefereeIntroTimer(elapsedMs, runId, () => {
+      const intro = this.refereeIntroElements;
+      if (!intro) {
+        return;
+      }
+      intro.roundSign.style.display = "none";
+      this.fadeRefereeAuraSound();
+      this.addRefereeIntroTween(
+        this.tweens.add({
+          targets: intro.aura,
+          y: config.startY + config.auraOffsetY,
+          alpha: 0,
+          duration: config.exitMs,
+          ease: "Sine.easeIn",
+        }),
+      );
+      this.addRefereeIntroTween(
+        this.tweens.add({
+          targets: intro.referee,
+          y: config.startY,
+          alpha: 0,
+          duration: config.exitMs,
+          ease: "Sine.easeIn",
+          onComplete: () => this.finishRefereeRoundIntro(runId),
+        }),
+      );
+    });
+  }
+
+  private setRefereeIntroFrame(frameIndex: number, roundNumber: number) {
+    const intro = this.refereeIntroElements;
+    const frame = refereeIntroManifest.frames[frameIndex];
+    if (!intro || !frame) {
+      return;
+    }
+
+    intro.frame.src = frame.path;
+    const signIsVisible = frameIndex === 3 || frameIndex === 4;
+    intro.roundSign.style.display = signIsVisible ? "block" : "none";
+    if (signIsVisible) {
+      intro.roundSign.textContent = `ROUND\n${roundNumber}`;
+    }
+  }
+
+  private finishRefereeRoundIntro(runId: number) {
+    if (!this.isRefereeIntroCurrent(runId)) {
+      return;
+    }
+
+    this.cleanupRefereeRoundIntro();
+    this.ui.showRoundMessage("FIGHT");
+    this.playSfx(sfxManifest.roundStart.key, "roundStart", {
+      oneShot: true,
+      cooldownMs: 1200,
+      volumeMultiplier: audioConfig.fightVolumeMultiplier,
+      allowBoost: true,
+    });
+    const fightTimer = this.time.delayedCall(refereeRoundIntroPresentation.fightMessageMs, () => {
+      if (this.screen === "playing" && !this.roundEndHandled && !this.roundIntroActive) {
+        this.ui.hideRoundMessage();
+      }
+    });
+    this.refereeIntroTimers.push(fightTimer);
+  }
+
+  private addRefereeIntroTimer(delayMs: number, runId: number, callback: () => void) {
+    const timer = this.time.delayedCall(delayMs, () => {
+      if (this.isRefereeIntroCurrent(runId)) {
+        callback();
+      }
+    });
+    this.refereeIntroTimers.push(timer);
+  }
+
+  private addRefereeIntroTween(tween: Phaser.Tweens.Tween) {
+    this.refereeIntroTweens.push(tween);
+  }
+
+  private isRefereeIntroCurrent(runId: number) {
+    return this.roundIntroActive && this.refereeIntroRunId === runId && this.screen === "playing" && !this.roundEndHandled;
+  }
+
+  private cleanupRefereeRoundIntro() {
+    this.stopRefereeAuraSound();
+    this.cleanupSpawnEntrance();
+    this.roundIntroActive = false;
+    this.refereeIntroRunId += 1;
+    for (const timer of this.refereeIntroTimers) {
+      timer.remove(false);
+    }
+    this.refereeIntroTimers = [];
+    for (const tween of this.refereeIntroTweens) {
+      tween.stop();
+      tween.remove();
+    }
+    this.refereeIntroTweens = [];
+    this.refereeIntroElements?.aura.destroy();
+    this.refereeIntroElements?.referee.destroy();
+    this.refereeIntroElements = null;
+  }
+
+  private startRefereeAuraSound() {
+    this.stopRefereeAuraSound();
+    const key = extraSfxManifest.refereeAura.key;
+    if (!this.cache.audio.exists(key)) {
+      return;
+    }
+    try {
+      const sound = this.sound.add(key, {
+        loop: true,
+        volume: Math.min(1, audioConfig.sfxVolume * audioConfig.refereeAuraVolumeMultiplier),
+      });
+      this.refereeAuraSound = sound;
+      sound.once("destroy", () => {
+        if (this.refereeAuraSound === sound) {
+          this.refereeAuraSound = null;
+        }
+      });
+      sound.play();
+    } catch {
+      this.refereeAuraSound = null;
+    }
+  }
+
+  private fadeRefereeAuraSound() {
+    const sound = this.refereeAuraSound;
+    if (!sound) {
+      return;
+    }
+    const volumeSound = sound as Phaser.Sound.BaseSound & {
+      volume?: number;
+      setVolume?: (volume: number) => Phaser.Sound.BaseSound;
+    };
+    if (!volumeSound.setVolume) {
+      this.stopRefereeAuraSound();
+      return;
+    }
+    const volumeState = { value: volumeSound.volume ?? audioConfig.sfxVolume * audioConfig.refereeAuraVolumeMultiplier };
+    this.addRefereeIntroTween(
+      this.tweens.add({
+        targets: volumeState,
+        value: 0,
+        duration: audioConfig.refereeAuraFadeMs,
+        ease: "Sine.easeIn",
+        onUpdate: () => {
+          volumeSound.setVolume?.(volumeState.value);
+        },
+        onComplete: () => {
+          this.stopRefereeAuraSound();
+        },
+      }),
+    );
+  }
+
+  private stopRefereeAuraSound() {
+    const sound = this.refereeAuraSound;
+    this.refereeAuraSound = null;
+    if (!sound) {
+      return;
+    }
+    sound.stop();
+    sound.destroy();
+  }
+
   private confirmCharacterSelection() {
     if (this.selectionConfirming) {
       return;
@@ -900,6 +1449,21 @@ export class BattleScene extends Phaser.Scene {
     }
   }
 
+  private configureFighterTextureFiltering() {
+    const fighterTextureKeys = new Set([
+      ...allPoseAssets().map((asset) => asset.key),
+      ...allFrameAnimationAssets().map((asset) => asset.key),
+      ...allThrowAssets().map((asset) => asset.key),
+      ...allSpecialAssets().map((asset) => asset.key),
+    ]);
+
+    for (const key of fighterTextureKeys) {
+      if (this.textures.exists(key)) {
+        this.textures.get(key).setFilter(Phaser.Textures.FilterMode.NEAREST);
+      }
+    }
+  }
+
   private vfxAnimationKey(key: string) {
     return `vfx-${key}`;
   }
@@ -917,11 +1481,20 @@ export class BattleScene extends Phaser.Scene {
 
   private createSpecialFallbackTexture(key: string, effect: SpecialEffectKind, label: string) {
     const graphics = this.make.graphics({ x: 0, y: 0 }, false);
-    graphics.fillStyle(effect === "car-rush" ? 0x050505 : effect === "rasengan" ? 0x1c82ff : effect === "mango-projectile" ? 0x4bcf48 : 0x2c3440, 1);
+    graphics.fillStyle(
+      effect === "car-rush"
+        ? 0x050505
+        : effect === "rasengan" || effect === "kamehameha"
+          ? 0x1c82ff
+          : effect === "mango-projectile"
+            ? 0x4bcf48
+            : 0x2c3440,
+      1,
+    );
     graphics.fillRoundedRect(0, 38, 220, 88, 18);
     graphics.fillStyle(0xffffff, 0.9);
     graphics.fillRoundedRect(38, 16, 88, 46, 12);
-    graphics.fillStyle(effect === "rasengan" ? 0x8deeff : 0xf4c84a, 1);
+    graphics.fillStyle(effect === "rasengan" || effect === "kamehameha" ? 0x8deeff : 0xf4c84a, 1);
     graphics.fillCircle(180, 82, 28);
     graphics.lineStyle(8, 0xffffff, 0.72);
     graphics.strokeRoundedRect(4, 4, 212, 132, 16);
@@ -993,6 +1566,14 @@ export class BattleScene extends Phaser.Scene {
     this.add.rectangle(480, 510, 960, 60, 0x06080c, 0.28).setDepth(-2);
   }
 
+  private fitBattleCamera() {
+    const { width, height } = this.scale.gameSize;
+    const zoom = Math.max(width / logicalStageWidth, height / logicalStageHeight);
+    this.cameras.main.setViewport(0, 0, width, height);
+    this.cameras.main.setZoom(zoom);
+    this.cameras.main.centerOn(logicalStageWidth / 2, logicalStageHeight / 2);
+  }
+
   private destroyFighterViews() {
     const staleViews: Phaser.GameObjects.GameObject[] = [];
     this.children.each((child) => {
@@ -1006,6 +1587,17 @@ export class BattleScene extends Phaser.Scene {
     this.fighterViews.clear();
   }
 
+  private setFighterDisplaySize(
+    sprite: Phaser.GameObjects.Sprite,
+    def: FighterAssetManifest,
+    effectScale: number,
+  ) {
+    sprite.setDisplaySize(
+      def.body.drawWidth * def.scale * fighterBattleVisualScale * effectScale,
+      def.body.drawHeight * def.scale * fighterBattleVisualScale * effectScale,
+    );
+  }
+
   private createFighterView(
     id: FighterId,
     def: FighterAssetManifest,
@@ -1017,7 +1609,7 @@ export class BattleScene extends Phaser.Scene {
     const shadow = this.add.ellipse(x, y + 8, def.body.drawWidth * 0.62, 28, 0x000000, 0.34);
     const sprite = this.add.sprite(x, y, pose.key);
     sprite.setOrigin(0.5, 1);
-    sprite.setDisplaySize(def.body.drawWidth * def.scale, def.body.drawHeight * def.scale);
+    this.setFighterDisplaySize(sprite, def, 1);
     sprite.setFlipX(shouldFlipFighterAsset(def, "idle", facing));
     sprite.setData("fighterView", true);
     shadow.setData("fighterView", true);
@@ -1034,6 +1626,7 @@ export class BattleScene extends Phaser.Scene {
 
   private syncViews(snapshot: RoundSnapshot) {
     const specialSequence = snapshot.specialSequence;
+    const throwSequence = snapshot.throwSequence;
     for (const fighter of Object.values(snapshot.fighters)) {
       const view = this.fighterViews.get(fighter.id);
       if (!view) {
@@ -1041,25 +1634,40 @@ export class BattleScene extends Phaser.Scene {
       }
       view.sprite.setPosition(fighter.x + view.effect.offsetX, fighter.y + view.effect.offsetY);
       view.sprite.setAngle(view.effect.angle);
-      view.sprite.setDisplaySize(
-        fighter.def.body.drawWidth * fighter.def.scale * view.effect.scale,
-        fighter.def.body.drawHeight * fighter.def.scale * view.effect.scale,
-      );
+      this.setFighterDisplaySize(view.sprite, fighter.def, view.effect.scale);
       view.shadow.setPosition(fighter.x, fighter.y + 8);
       view.shadow.setScale(fighter.grounded ? 1 : 0.74);
+      view.shadow.setAlpha(fighter.grounded ? 0.34 : 0.16);
 
-      const frameAnimationName = this.getFrameAnimationName(snapshot, fighter);
-      const frameAnimationApplied = frameAnimationName
-        ? this.applyFrameAnimation(view, fighter, frameAnimationName)
-        : false;
-      if (frameAnimationApplied) {
-        // Texture and flip are handled by the active frame animation.
-      } else {
+      const isThrowingCaster = throwSequence.phase !== "idle" && throwSequence.casterId === fighter.id;
+      const isThrownVictim =
+        throwSequence.phase !== "idle" &&
+        throwSequence.success &&
+        throwSequence.victimId === fighter.id;
+
+      let frameAnimationApplied = false;
+      if (isThrowingCaster) {
         this.stopLoopAnimation(view);
-        view.sprite.setFlipX(this.shouldFlipFighterPose(fighter, fighter.pose));
+        this.applyThrowFrame(view, fighter, throwSequence);
+        view.lastPose = null;
+      } else if (isThrownVictim) {
+        this.stopLoopAnimation(view);
+        this.applyThrownVictimPose(view, fighter, throwSequence);
+        view.lastPose = null;
+      } else {
+        const frameAnimationName = this.getFrameAnimationName(snapshot, fighter);
+        frameAnimationApplied = frameAnimationName
+          ? this.applyFrameAnimation(view, fighter, frameAnimationName)
+          : false;
+        if (frameAnimationApplied) {
+          // Texture and flip are handled by the active frame animation.
+        } else {
+          this.stopLoopAnimation(view);
+          view.sprite.setFlipX(this.shouldFlipFighterPose(fighter, fighter.pose));
+        }
       }
 
-      if (!frameAnimationApplied && view.lastPose !== fighter.pose) {
+      if (!isThrowingCaster && !isThrownVictim && !frameAnimationApplied && view.lastPose !== fighter.pose) {
         this.applyPose(view, fighter, fighter.pose);
         view.lastPose = fighter.pose;
       }
@@ -1070,12 +1678,20 @@ export class BattleScene extends Phaser.Scene {
         specialIntroPresentation.specialIntroTint !== null
       ) {
         view.sprite.setTint(specialIntroPresentation.specialIntroTint);
+      } else if (isThrownVictim) {
+        view.sprite.clearTint();
       } else if (fighter.hitStunMs > 0) {
         view.sprite.setTint(0xffb2a8);
       } else if (fighter.health <= 0) {
         view.sprite.setTint(0x9a9a9a);
       } else {
         view.sprite.clearTint();
+      }
+
+      if (this.spawnEntranceActive) {
+        const revealed = this.spawnEntranceRevealed.has(fighter.id);
+        view.sprite.setAlpha(revealed ? 1 : 0);
+        view.shadow.setAlpha(revealed && fighter.grounded ? 0.34 : 0);
       }
     }
   }
@@ -1087,10 +1703,7 @@ export class BattleScene extends Phaser.Scene {
       if (this.anims.exists(animationKey)) {
         view.sprite.play(animationKey, true);
         view.sprite.setOrigin(0.5, 1);
-        view.sprite.setDisplaySize(
-          fighter.def.body.drawWidth * fighter.def.scale * view.effect.scale,
-          fighter.def.body.drawHeight * fighter.def.scale * view.effect.scale,
-        );
+        this.setFighterDisplaySize(view.sprite, fighter.def, view.effect.scale);
         view.sprite.setFlipX(this.shouldFlipFighterPose(fighter, poseName));
         return;
       }
@@ -1103,6 +1716,58 @@ export class BattleScene extends Phaser.Scene {
       return fighter.def.jumpBaseFacing ?? fighter.def.poses[poseName].sourceFacing ?? fighter.def.baseFacing;
     }
     return fighter.def.poses[poseName].sourceFacing ?? fighter.def.baseFacing;
+  }
+
+  private applyThrowFrame(view: FighterView, fighter: FighterState, sequence: ThrowSequenceState) {
+    const frameIndex = sequence.phase === "lift" ? 1 : sequence.phase === "slam" || sequence.phase === "impact" || sequence.phase === "recovery" ? 2 : 0;
+    const frame = fighter.def.throw?.frames[frameIndex];
+    if (frame && this.textures.exists(frame.key)) {
+      this.setFighterTexture(view, fighter, frame.key, frame.sourceFacing ?? fighter.def.baseFacing, false);
+      return;
+    }
+
+    const fallback = fighter.def.throw?.fallback;
+    if (fallback && this.textures.exists(fallback.key)) {
+      this.setFighterTexture(view, fighter, fallback.key, fallback.sourceFacing ?? fighter.def.baseFacing, false);
+      return;
+    }
+
+    // A missing throw asset is still playable: the normal punch reads as a short lunge.
+    this.applyPose(view, fighter, this.textures.exists(fighter.def.poses.punch.key) ? "punch" : "idle");
+  }
+
+  private applyThrownVictimPose(view: FighterView, fighter: FighterState, sequence: ThrowSequenceState) {
+    const useKoPose =
+      fighter.health <= 0 ||
+      sequence.phase === "slam" ||
+      sequence.phase === "impact" ||
+      sequence.phase === "recovery";
+    const pose = useKoPose && this.textures.exists(fighter.def.poses.ko.key) ? fighter.def.poses.ko : fighter.def.poses.hurt;
+    this.setFighterTexture(
+      view,
+      fighter,
+      pose.key,
+      this.getPoseSourceFacing(fighter, pose === fighter.def.poses.ko ? "ko" : "hurt"),
+      false,
+    );
+    const caster = sequence.casterId ? this.sim?.snapshot.fighters[sequence.casterId] : null;
+    const facing = caster?.facing ?? fighter.facing;
+    const recoveryProgress = Math.min(1, sequence.phaseElapsedMs / THROW_RECOVERY_MS);
+    const angle =
+      sequence.phase === "startup"
+        ? -11 * facing
+        : sequence.phase === "lift"
+          ? -26 * facing
+          : sequence.phase === "slam"
+            ? 58 * facing
+            : sequence.phase === "impact"
+              ? 42 * facing
+              : sequence.phase === "recovery"
+                ? fighter.health <= 0
+                  ? 28 * facing
+                  : Phaser.Math.Linear(58 * facing, 0, recoveryProgress)
+                : 0;
+    view.sprite.setAngle(angle);
   }
 
   private getFrameAnimationName(snapshot: RoundSnapshot, fighter: FighterState): MovementAnimationName | null {
@@ -1176,10 +1841,7 @@ export class BattleScene extends Phaser.Scene {
       view.sprite.setTexture(textureKey);
     }
     view.sprite.setOrigin(0.5, 1);
-    view.sprite.setDisplaySize(
-      fighter.def.body.drawWidth * fighter.def.scale * view.effect.scale,
-      fighter.def.body.drawHeight * fighter.def.scale * view.effect.scale,
-    );
+    this.setFighterDisplaySize(view.sprite, fighter.def, view.effect.scale);
     const unflippedFacing = sourceFacing === "right" ? 1 : -1;
     view.sprite.setFlipX(this.getRenderFacing(fighter) !== unflippedFacing);
     if (resetAlpha) {
@@ -1536,18 +2198,25 @@ export class BattleScene extends Phaser.Scene {
     this.specialEffectObjects = [];
 
     this.cameras.main.resetFX();
-    this.cameras.main.setZoom(1);
-    this.cameras.main.centerOn(480, 270);
-    for (const view of this.fighterViews.values()) {
+    this.fitBattleCamera();
+    for (const fighter of Object.values(this.sim?.snapshot.fighters ?? {})) {
+      const view = this.fighterViews.get(fighter.id);
+      if (!view) {
+        continue;
+      }
       this.stopLoopAnimation(view);
       view.effect.offsetX = 0;
       view.effect.offsetY = 0;
       view.effect.angle = 0;
       view.effect.scale = 1;
+      view.sprite.setAngle(0);
+      view.sprite.setScale(1);
       view.sprite.setAlpha(1);
       view.sprite.clearTint();
       view.sprite.setDepth(3);
       view.shadow.setDepth(2);
+      this.applyPose(view, fighter, fighter.pose);
+      view.lastPose = fighter.pose;
     }
     for (const audio of this.specialHtmlAudios) {
       audio.pause();
@@ -1732,9 +2401,33 @@ export class BattleScene extends Phaser.Scene {
       this.playMangoProjectileEffect(attacker, victim);
     } else if (special.effect === "satellite-strike") {
       this.playSatelliteStrikeEffect(attacker, victim);
+    } else if (special.effect === "kamehameha") {
+      this.playKamehamehaFallbackEffect(attacker, victim);
     } else {
       this.playRasenganEffect(attacker, victim);
     }
+  }
+
+  private playThrowImpactVfx(attacker: FighterState, victim: FighterState) {
+    this.playConfiguredVfx(
+      { assetKey: "big-hit", displayWidth: 196, displayHeight: 160, offsetY: 18, flipWithFacing: true },
+      victim.x - attacker.facing * 12,
+      victim.y - 18,
+      attacker.facing,
+    );
+    const shockwave = this.trackVfxObject(this.add.ellipse(victim.x, victim.y + 3, 68, 16, 0xf4c84a, 0.65));
+    shockwave.setDepth(14);
+    this.trackVfxTween(
+      this.tweens.add({
+        targets: shockwave,
+        scaleX: 2.2,
+        scaleY: 1.7,
+        alpha: 0,
+        duration: 210,
+        ease: "Sine.easeOut",
+        onComplete: () => shockwave.destroy(),
+      }),
+    );
   }
 
   private playSuperFlightEffect(attacker: FighterState, victim: FighterState) {
@@ -1798,7 +2491,9 @@ export class BattleScene extends Phaser.Scene {
     const isCarRush = attacker.def.special.effect === "car-rush";
     const isSuperFlight = attacker.def.special.effect === "super-flight";
     const isStationaryCaster =
-      attacker.def.special.effect === "mango-projectile" || attacker.def.special.effect === "satellite-strike";
+      attacker.def.special.effect === "mango-projectile" ||
+      attacker.def.special.effect === "satellite-strike" ||
+      attacker.def.special.effect === "kamehameha";
     const startX = isCarRush
       ? (attacker.facing === 1 ? -170 : 1130)
       : attacker.x + (isStationaryCaster ? 0 : attacker.facing * 24);
@@ -1823,6 +2518,14 @@ export class BattleScene extends Phaser.Scene {
       casterView.sprite.setAlpha(0);
     }
 
+    let kamehamehaCharge: Phaser.GameObjects.DOMElement | null = null;
+    if (attacker.def.special.effect === "kamehameha") {
+      kamehamehaCharge = this.playKamehamehaCharge(
+        attacker,
+        this.getSpecialFrameStartMs(attacker, attacker.def.special.impactFrame ?? 4),
+      );
+    }
+
     if (attacker.def.special.effect === "mango-projectile") {
       this.playMangoProjectileEffect(attacker, victim);
     } else if (attacker.def.special.effect === "satellite-strike") {
@@ -1830,6 +2533,7 @@ export class BattleScene extends Phaser.Scene {
     }
 
     let elapsedMs = 0;
+    const impactIndex = (attacker.def.special.impactFrame ?? 4) - 1;
     for (const [index, frame] of frames.entries()) {
       const frameStartMs = elapsedMs;
       this.trackSpecialTimer(
@@ -1839,11 +2543,26 @@ export class BattleScene extends Phaser.Scene {
           }
           sprite.setTexture(frame.key);
           sprite.setFlipX(shouldFlipSpecialFrameAsset(attacker.def, index, attacker.facing));
-          if (index === (attacker.def.special.impactFrame ?? 4) - 1) {
+          if (attacker.def.special.effect === "kamehameha" && kamehamehaCharge) {
+            if (index === 1) {
+              this.updateKamehamehaChargePosition(kamehamehaCharge, attacker, index);
+              kamehamehaCharge.setAlpha(1);
+            } else if (index === 2) {
+              this.updateKamehamehaChargePosition(kamehamehaCharge, attacker, index);
+            }
+          }
+          if (index === impactIndex) {
             if (attacker.def.special.effect === "ground-smash" || attacker.def.special.effect === "barbell") {
               this.cameras.main.shake(260, 0.012);
             } else {
               this.cameras.main.shake(180, 0.008);
+            }
+            if (attacker.def.special.effect === "kamehameha") {
+              if (kamehamehaCharge?.active) {
+                kamehamehaCharge.destroy();
+              }
+              kamehamehaCharge = null;
+              this.playKamehamehaBeam(attacker, victim, frameDurations[index] ?? SPECIAL_FRAME_MS);
             }
           }
         }),
@@ -1950,6 +2669,143 @@ export class BattleScene extends Phaser.Scene {
             },
           }),
         );
+      }),
+    );
+  }
+
+  private playKamehamehaCharge(attacker: FighterState, durationMs: number): Phaser.GameObjects.DOMElement | null {
+    const chargeAsset = attacker.def.special.chargeAsset;
+    if (!chargeAsset || durationMs <= 0) {
+      return null;
+    }
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "kamehameha-charge";
+    wrapper.style.width = `${chargeAsset.displayWidth ?? 165}px`;
+    wrapper.style.height = `${chargeAsset.displayHeight ?? 165}px`;
+
+    const image = document.createElement("img");
+    image.className = "kamehameha-charge-image";
+    image.alt = "";
+    image.draggable = false;
+    image.src = chargeAsset.path;
+    const sourceFacing = chargeAsset.sourceFacing ?? "right";
+    const sourceDirection = sourceFacing === "right" ? 1 : -1;
+    image.style.transform = attacker.facing === sourceDirection ? "scaleX(1)" : "scaleX(-1)";
+    wrapper.append(image);
+
+    const charge = this.trackSpecialObject(this.add.dom(attacker.x, attacker.y, wrapper).setOrigin(0.5));
+    charge.setDepth(8);
+    charge.setAlpha(0);
+    this.updateKamehamehaChargePosition(charge, attacker, 1);
+    image.addEventListener("error", () => {
+      if (charge.active) {
+        charge.destroy();
+      }
+    }, { once: true });
+
+    this.trackSpecialTimer(
+      this.time.delayedCall(durationMs, () => {
+        if (charge.active) {
+          charge.destroy();
+        }
+      }),
+    );
+    return charge;
+  }
+
+  private updateKamehamehaChargePosition(
+    charge: Phaser.GameObjects.DOMElement,
+    attacker: FighterState,
+    frameIndex: number,
+  ) {
+    const chargeAsset = attacker.def.special.chargeAsset;
+    if (!chargeAsset || !charge.active) {
+      return;
+    }
+    const offsetX = chargeAsset.offsetXByFrame?.[frameIndex] ?? chargeAsset.offsetX ?? -82;
+    const offsetY = chargeAsset.offsetYByFrame?.[frameIndex] ?? chargeAsset.offsetY ?? -132;
+    charge.setPosition(attacker.x + attacker.facing * offsetX, attacker.y + offsetY);
+    const image = charge.node.querySelector(".kamehameha-charge-image");
+    if (image instanceof HTMLImageElement) {
+      const sourceFacing = chargeAsset.sourceFacing ?? "right";
+      const sourceDirection = sourceFacing === "right" ? 1 : -1;
+      image.style.transform = attacker.facing === sourceDirection ? "scaleX(1)" : "scaleX(-1)";
+    }
+  }
+
+  private playKamehamehaBeam(attacker: FighterState, victim: FighterState, durationMs: number) {
+    const beamAsset = attacker.def.special.beamAsset;
+    const startX = attacker.x + attacker.facing * 78;
+    const targetX = Phaser.Math.Clamp(
+      victim.x - attacker.facing * 28,
+      attacker.facing === 1 ? startX + 120 : 80,
+      attacker.facing === 1 ? 880 : startX - 120,
+    );
+    const beamLength = Phaser.Math.Clamp(Math.abs(targetX - startX) + 80, 240, 700);
+    const beamY = attacker.y - 132;
+
+    if (!beamAsset) {
+      this.playKamehamehaFallbackEffect(attacker, victim, durationMs);
+      return;
+    }
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "kamehameha-beam";
+    wrapper.style.width = `${beamLength}px`;
+    wrapper.style.height = "150px";
+
+    const image = document.createElement("img");
+    image.className = "kamehameha-beam-image";
+    image.alt = "";
+    image.draggable = false;
+    image.src = beamAsset.path;
+    const sourceFacing = beamAsset.sourceFacing ?? "right";
+    const sourceDirection = sourceFacing === "right" ? 1 : -1;
+    image.style.transform = attacker.facing === sourceDirection ? "scaleX(1)" : "scaleX(-1)";
+    wrapper.append(image);
+
+    const x = startX + attacker.facing * (beamLength / 2);
+    const domBeam = this.trackSpecialObject(this.add.dom(x, beamY, wrapper).setOrigin(0.5));
+    domBeam.setDepth(12);
+
+    image.addEventListener("error", () => {
+      if (!domBeam.active) {
+        return;
+      }
+      domBeam.destroy();
+      this.playKamehamehaFallbackEffect(attacker, victim, durationMs);
+    }, { once: true });
+
+    this.trackSpecialTimer(
+      this.time.delayedCall(durationMs, () => {
+        if (domBeam.active) {
+          domBeam.destroy();
+        }
+      }),
+    );
+  }
+
+  private playKamehamehaFallbackEffect(attacker: FighterState, victim: FighterState, durationMs = 650) {
+    const startX = attacker.x + attacker.facing * 78;
+    const targetX = Phaser.Math.Clamp(
+      victim.x - attacker.facing * 28,
+      attacker.facing === 1 ? startX + 120 : 80,
+      attacker.facing === 1 ? 880 : startX - 120,
+    );
+    const y = attacker.y - 132;
+    const beam = this.trackSpecialObject(this.add.graphics().setDepth(12));
+    beam.lineStyle(58, 0x247dff, 0.3);
+    beam.lineBetween(startX, y, targetX, y);
+    beam.lineStyle(30, 0x62c9ff, 0.86);
+    beam.lineBetween(startX, y, targetX, y);
+    beam.lineStyle(10, 0xf2fdff, 0.96);
+    beam.lineBetween(startX, y, targetX, y);
+    this.trackSpecialTimer(
+      this.time.delayedCall(durationMs, () => {
+        if (beam.active) {
+          beam.destroy();
+        }
       }),
     );
   }
@@ -2205,12 +3061,18 @@ export class BattleScene extends Phaser.Scene {
       this.playSfx(announcement.key, "roundStart", {
         oneShot: true,
         cooldownMs: 1200,
-        volumeMultiplier: 1.12,
+        volumeMultiplier: audioConfig.roundAnnouncementVolumeMultiplier,
+        allowBoost: true,
       })
     ) {
       return;
     }
-    this.playSfx(sfxManifest.roundStart.key, "roundStart", { oneShot: true, cooldownMs: 1200 });
+    this.playSfx(sfxManifest.roundStart.key, "roundStart", {
+      oneShot: true,
+      cooldownMs: 1200,
+      volumeMultiplier: audioConfig.roundAnnouncementVolumeMultiplier,
+      allowBoost: true,
+    });
   }
 
   private getAudioPauseMs(key: string) {
@@ -2396,7 +3258,7 @@ export class BattleScene extends Phaser.Scene {
   private playSfx(
     key: string,
     fallbackName: keyof typeof sfxManifest | string,
-    options: { oneShot?: boolean; cooldownMs?: number; volumeMultiplier?: number } = {},
+    options: { oneShot?: boolean; cooldownMs?: number; volumeMultiplier?: number; allowBoost?: boolean } = {},
   ): boolean {
     if (this.screen === "paused") {
       return false;
@@ -2413,7 +3275,9 @@ export class BattleScene extends Phaser.Scene {
     }
     if (this.cache.audio.exists(key)) {
       try {
-        const volume = Math.min(1, audioConfig.sfxVolume * (options.volumeMultiplier ?? 1));
+        const volume = options.allowBoost
+          ? audioConfig.sfxVolume * (options.volumeMultiplier ?? 1)
+          : Math.min(1, audioConfig.sfxVolume * (options.volumeMultiplier ?? 1));
         if (options.oneShot) {
           const sound = this.sound.add(key, { volume });
           this.playingSfxKeys.add(key);

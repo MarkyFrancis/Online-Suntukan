@@ -18,11 +18,19 @@ import {
   HIT_STUN_REHIT_REDUCTION,
   HIT_STUN_REHIT_THRESHOLD_MS,
   PUNCH2_COMBO_WINDOW_MS,
+  THROW_COOLDOWN_MS,
+  THROW_DAMAGE,
+  THROW_FRAME_MS,
+  THROW_HITSTUN_MS,
+  THROW_KNOCKBACK,
+  THROW_RANGE,
+  THROW_RECOVERY_MS,
+  THROW_STARTUP_MS,
   attacks,
 } from "../config/attacks";
 import type { PlayerInput } from "../input/bindings";
 import { emptyInput } from "../input/bindings";
-import type { FighterId, FighterState, GameMode, RoundSnapshot, SpecialSequenceState } from "./types";
+import type { FighterId, FighterState, GameMode, RoundSnapshot, SpecialSequenceState, ThrowSequenceState } from "./types";
 
 const defaultGroundY = 474;
 const stageLeft = 72;
@@ -35,6 +43,8 @@ const friction = 0.78;
 const maxHealth = 200;
 const roundLengthMs = 120_000;
 const specialImpactHoldMs = 180;
+const throwLiftHeight = 86;
+const throwImpactAtMs = Math.round(THROW_FRAME_MS * 0.72);
 
 export type RoundEvents = {
   onAttack?: (fighter: FighterState, attackName: AttackName) => void;
@@ -43,6 +53,9 @@ export type RoundEvents = {
   onSpecialStart?: (fighter: FighterState, victim: FighterState) => void;
   onSpecialHit?: (attacker: FighterState, victim: FighterState) => void;
   onSpecialEnd?: () => void;
+  onThrowStart?: (attacker: FighterState, victim: FighterState, success: boolean) => void;
+  onThrowImpact?: (attacker: FighterState, victim: FighterState) => void;
+  onThrowEnd?: () => void;
   onKo?: (winner: FighterId | "draw") => void;
 };
 
@@ -72,6 +85,7 @@ export class RoundSimulation {
         p2: this.createFighter("p2", p2Def, 700, -1),
       },
       specialSequence: this.createIdleSpecialSequence(),
+      throwSequence: this.createIdleThrowSequence(),
     };
   }
 
@@ -80,17 +94,23 @@ export class RoundSimulation {
   }
 
   cancelSpecialSequence() {
+    const wasThrowing = this.snapshotValue.throwSequence.phase !== "idle";
     for (const fighter of Object.values(this.snapshotValue.fighters)) {
       fighter.activeAttack = null;
       fighter.vx = 0;
       fighter.vy = 0;
       fighter.blocking = false;
       fighter.hitStunMs = 0;
+      if (wasThrowing) {
+        fighter.y = this.groundY;
+        fighter.grounded = true;
+      }
       if (fighter.health > 0) {
         fighter.pose = "idle";
       }
     }
     this.snapshotValue.specialSequence = this.createIdleSpecialSequence();
+    this.snapshotValue.throwSequence = this.createIdleThrowSequence();
   }
 
   update(dtMs: number, inputs: { p1: PlayerInput; p2: PlayerInput }) {
@@ -106,12 +126,30 @@ export class RoundSimulation {
       return;
     }
 
+    if (this.snapshotValue.throwSequence.phase !== "idle") {
+      this.updateThrowSequence(dtMs);
+      this.updateFacing();
+      this.updatePoses();
+      this.checkEndState();
+      return;
+    }
+
     const dt = dtMs / 1000;
     this.snapshotValue.timerMs = Math.max(0, this.snapshotValue.timerMs - dtMs);
 
     this.updateFighter(this.snapshotValue.fighters.p1, inputs.p1, dt, dtMs);
-    this.updateFighter(this.snapshotValue.fighters.p2, inputs.p2, dt, dtMs);
+    if (
+      this.snapshotValue.throwSequence.phase === "idle" ||
+      !this.snapshotValue.throwSequence.success
+    ) {
+      this.updateFighter(this.snapshotValue.fighters.p2, inputs.p2, dt, dtMs);
+    }
     this.updateFacing();
+    if (this.snapshotValue.throwSequence.phase !== "idle") {
+      this.updatePoses();
+      this.checkEndState();
+      return;
+    }
     this.resolveBodyPush();
     this.resolveAttack(this.snapshotValue.fighters.p1, this.snapshotValue.fighters.p2);
     this.resolveAttack(this.snapshotValue.fighters.p2, this.snapshotValue.fighters.p1);
@@ -127,6 +165,19 @@ export class RoundSimulation {
       elapsedMs: 0,
       phaseElapsedMs: 0,
       hasHit: false,
+    };
+  }
+
+  private createIdleThrowSequence(): ThrowSequenceState {
+    return {
+      phase: "idle",
+      casterId: null,
+      victimId: null,
+      phaseElapsedMs: 0,
+      success: false,
+      impactApplied: false,
+      slideStartX: null,
+      slideTargetX: null,
     };
   }
 
@@ -150,6 +201,7 @@ export class RoundSimulation {
       pose: "idle",
       hitStunMs: 0,
       blocking: false,
+      throwCooldownMs: 0,
       attackCooldowns: {
         punch: 0,
         punch2: 0,
@@ -165,6 +217,7 @@ export class RoundSimulation {
     fighter.attackCooldowns.punch = Math.max(0, fighter.attackCooldowns.punch - dtMs);
     fighter.attackCooldowns.punch2 = Math.max(0, fighter.attackCooldowns.punch2 - dtMs);
     fighter.attackCooldowns.kick = Math.max(0, fighter.attackCooldowns.kick - dtMs);
+    fighter.throwCooldownMs = Math.max(0, fighter.throwCooldownMs - dtMs);
 
     if (fighter.health > 0) {
       fighter.specialMeter = Math.min(
@@ -204,6 +257,8 @@ export class RoundSimulation {
         this.tryStartAttack(fighter, "punch2");
       } else if (input.kick) {
         this.tryStartAttack(fighter, "kick");
+      } else if (input.throw) {
+        this.tryStartThrow(fighter);
       } else if (input.special) {
         this.tryStartSpecial(fighter);
       }
@@ -295,6 +350,168 @@ export class RoundSimulation {
       hasHit: false,
     };
     this.events.onSpecialStart?.(fighter, victim);
+  }
+
+  private tryStartThrow(fighter: FighterState) {
+    if (
+      !fighter.def.throw ||
+      !fighter.grounded ||
+      fighter.blocking ||
+      fighter.hitStunMs > 0 ||
+      fighter.activeAttack ||
+      fighter.throwCooldownMs > 0 ||
+      fighter.health <= 0 ||
+      this.snapshotValue.specialSequence.phase !== "idle" ||
+      this.snapshotValue.throwSequence.phase !== "idle"
+    ) {
+      return;
+    }
+
+    const victimId: FighterId = fighter.id === "p1" ? "p2" : "p1";
+    const victim = this.snapshotValue.fighters[victimId];
+    const centerDistance = Math.abs(victim.x - fighter.x);
+    const contactDistance = Math.max(0, centerDistance - (fighter.def.body.width + victim.def.body.width) / 2);
+    const victimInFront = fighter.facing * (victim.x - fighter.x) >= -8;
+    const success =
+      victim.grounded &&
+      victim.health > 0 &&
+      this.snapshotValue.specialSequence.phase === "idle" &&
+      contactDistance <= THROW_RANGE &&
+      victimInFront;
+
+    fighter.throwCooldownMs = THROW_COOLDOWN_MS;
+    fighter.activeAttack = null;
+    fighter.vx = 0;
+    fighter.vy = 0;
+    fighter.blocking = false;
+
+    if (success) {
+      victim.activeAttack = null;
+      victim.vx = 0;
+      victim.vy = 0;
+      victim.blocking = false;
+      victim.grounded = true;
+    }
+
+    this.snapshotValue.throwSequence = {
+      phase: success ? "startup" : "whiff",
+      casterId: fighter.id,
+      victimId: success ? victim.id : null,
+      phaseElapsedMs: 0,
+      success,
+      impactApplied: false,
+      slideStartX: null,
+      slideTargetX: null,
+    };
+    this.events.onThrowStart?.(fighter, victim, success);
+  }
+
+  private updateThrowSequence(dtMs: number) {
+    const sequence = this.snapshotValue.throwSequence;
+    if (sequence.phase === "idle" || !sequence.casterId) {
+      return;
+    }
+
+    const caster = this.snapshotValue.fighters[sequence.casterId];
+    const victim = sequence.victimId ? this.snapshotValue.fighters[sequence.victimId] : null;
+    caster.vx = 0;
+    caster.vy = 0;
+    caster.blocking = false;
+    sequence.phaseElapsedMs += dtMs;
+
+    if (!sequence.success || !victim) {
+      if (sequence.phaseElapsedMs >= THROW_STARTUP_MS + THROW_RECOVERY_MS) {
+        this.snapshotValue.throwSequence = this.createIdleThrowSequence();
+        this.events.onThrowEnd?.();
+      }
+      return;
+    }
+
+    victim.vx = 0;
+    victim.vy = 0;
+    victim.blocking = false;
+    const grabX = caster.x + caster.facing * Math.max(34, (caster.def.body.width + victim.def.body.width) * 0.3);
+
+    if (sequence.phase === "startup") {
+      const progress = Math.min(1, sequence.phaseElapsedMs / THROW_STARTUP_MS);
+      victim.x = Phaser.Math.Linear(victim.x, grabX, progress);
+      victim.y = this.groundY;
+      victim.grounded = true;
+      if (sequence.phaseElapsedMs >= THROW_STARTUP_MS) {
+        this.advanceThrowPhase("lift");
+      }
+      return;
+    }
+
+    if (sequence.phase === "lift") {
+      const progress = Math.min(1, sequence.phaseElapsedMs / THROW_FRAME_MS);
+      victim.x = grabX;
+      victim.y = this.groundY - throwLiftHeight * progress;
+      victim.grounded = false;
+      if (sequence.phaseElapsedMs >= THROW_FRAME_MS) {
+        this.advanceThrowPhase("slam");
+      }
+      return;
+    }
+
+    if (sequence.phase === "slam") {
+      const progress = Math.min(1, sequence.phaseElapsedMs / THROW_FRAME_MS);
+      victim.x = grabX + caster.facing * 12 * progress;
+      if (sequence.impactApplied) {
+        victim.y = this.groundY;
+        victim.grounded = true;
+      } else {
+        victim.y = this.groundY - throwLiftHeight * (1 - progress);
+        victim.grounded = false;
+
+        if (sequence.phaseElapsedMs >= throwImpactAtMs) {
+          sequence.impactApplied = true;
+          victim.y = this.groundY;
+          victim.grounded = true;
+          victim.health = Math.max(0, victim.health - THROW_DAMAGE);
+          victim.hitStunMs = THROW_HITSTUN_MS;
+          victim.vx = caster.facing * THROW_KNOCKBACK;
+          victim.specialMeter = Math.min(SPECIAL_METER_MAX, victim.specialMeter + SPECIAL_METER_TAKE_GAIN);
+          caster.specialMeter = Math.min(SPECIAL_METER_MAX, caster.specialMeter + Math.max(1, SPECIAL_METER_DEAL_GAIN * 0.55));
+          victim.pose = victim.health <= 0 ? "ko" : "hurt";
+          sequence.slideStartX = victim.x;
+          sequence.slideTargetX = Phaser.Math.Clamp(
+            victim.x + caster.facing * THROW_KNOCKBACK,
+            stageLeft,
+            stageRight,
+          );
+          this.events.onThrowImpact?.(caster, victim);
+          this.advanceThrowPhase("recovery");
+        }
+      }
+      if (sequence.phaseElapsedMs >= THROW_FRAME_MS) {
+        victim.y = this.groundY;
+        victim.grounded = true;
+        this.advanceThrowPhase("impact");
+      }
+      return;
+    }
+
+    if (sequence.phase === "recovery") {
+      const slideProgress = Math.min(1, sequence.phaseElapsedMs / THROW_RECOVERY_MS);
+      const slideEase = Phaser.Math.Easing.Sine.InOut(slideProgress);
+      const slideStartX = sequence.slideStartX ?? victim.x;
+      const slideTargetX = sequence.slideTargetX ?? slideStartX;
+      victim.x = Phaser.Math.Linear(slideStartX, slideTargetX, slideEase);
+      victim.y = this.groundY;
+      victim.grounded = true;
+      victim.vx = 0;
+
+      if (sequence.phaseElapsedMs >= THROW_RECOVERY_MS) {
+        this.snapshotValue.throwSequence = this.createIdleThrowSequence();
+        this.events.onThrowEnd?.();
+      }
+    }
+  }
+
+  private advanceThrowPhase(phase: ThrowSequenceState["phase"]) {
+    this.snapshotValue.throwSequence.phase = phase;
+    this.snapshotValue.throwSequence.phaseElapsedMs = 0;
   }
 
   private updateSpecialSequence(dtMs: number) {
@@ -481,9 +698,14 @@ export class RoundSimulation {
 
   private updatePoses() {
     const sequence = this.snapshotValue.specialSequence;
+    const throwSequence = this.snapshotValue.throwSequence;
     for (const fighter of Object.values(this.snapshotValue.fighters)) {
       if (fighter.health <= 0) {
         fighter.pose = "ko";
+      } else if (throwSequence.phase !== "idle" && throwSequence.casterId === fighter.id) {
+        fighter.pose = "idle";
+      } else if (throwSequence.success && throwSequence.victimId === fighter.id) {
+        fighter.pose = "hurt";
       } else if (sequence.phase !== "idle" && sequence.casterId === fighter.id) {
         fighter.pose = "idle";
       } else if (fighter.blocking) {

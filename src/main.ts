@@ -9,11 +9,20 @@ type GameWindow = Window & {
 const config: Phaser.Types.Core.GameConfig = {
   type: Phaser.AUTO,
   parent: "game-root",
-  width: 960,
-  height: 540,
+  width: 1920,
+  height: 1080,
   backgroundColor: "rgba(0, 0, 0, 0)",
   transparent: true,
   pixelArt: false,
+  render: {
+    // The battle canvas is often enlarged to fill a browser viewport. Keep cutout fighters crisp at that final scale.
+    antialias: false,
+    antialiasGL: false,
+    roundPixels: true,
+  },
+  dom: {
+    createContainer: true,
+  },
   scale: {
     mode: Phaser.Scale.ENVELOP,
     autoCenter: Phaser.Scale.CENTER_BOTH,

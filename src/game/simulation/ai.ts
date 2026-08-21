@@ -30,8 +30,23 @@ export class FighterAi {
     const next = emptyInput();
     const distance = Math.abs(target.x - ai.x);
     const targetIsRight = target.x > ai.x;
+    const contactDistance = Math.max(0, distance - (ai.def.body.width + target.def.body.width) / 2);
+    const canThrow =
+      ai.grounded &&
+      target.grounded &&
+      target.health > 0 &&
+      ai.throwCooldownMs <= 0 &&
+      Boolean(ai.def.throw) &&
+      contactDistance <= this.difficulty.throwRange;
+    const targetIsVulnerableToThrow = target.blocking || (!target.activeAttack && Math.abs(target.vx) < 18);
 
-    if (distance > this.difficulty.farRange) {
+    if (
+      canThrow &&
+      targetIsVulnerableToThrow &&
+      Math.random() < this.difficulty.throwChance * (target.blocking ? 1.35 : 1)
+    ) {
+      next.throw = true;
+    } else if (distance > this.difficulty.farRange) {
       if (Math.random() < this.difficulty.aggression) {
         next.left = !targetIsRight;
         next.right = targetIsRight;

@@ -7,6 +7,7 @@ export type PlayerInput = {
   punch: boolean;
   punch2: boolean;
   kick: boolean;
+  throw: boolean;
   special: boolean;
   block: boolean;
 };
@@ -18,6 +19,7 @@ export const emptyInput = (): PlayerInput => ({
   punch: false,
   punch2: false,
   kick: false,
+  throw: false,
   special: false,
   block: false,
 });
@@ -41,6 +43,7 @@ export function createKeyboardBindings(scene: Phaser.Scene): KeyboardBindings {
       jump: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.W),
       punch: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.F),
       kick: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.G),
+      throw: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.T),
       special: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.H),
       block: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.S),
     },
@@ -50,6 +53,7 @@ export function createKeyboardBindings(scene: Phaser.Scene): KeyboardBindings {
       jump: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.UP),
       punch: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.K),
       kick: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.L),
+      throw: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.I),
       special: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.O),
       block: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.DOWN),
     },
@@ -64,6 +68,7 @@ export function readInput(keys: Record<Exclude<keyof PlayerInput, "punch2">, Pha
     punch: Phaser.Input.Keyboard.JustDown(keys.punch),
     punch2: false,
     kick: Phaser.Input.Keyboard.JustDown(keys.kick),
+    throw: Phaser.Input.Keyboard.JustDown(keys.throw),
     special: Phaser.Input.Keyboard.JustDown(keys.special),
     block: keys.block.isDown,
   };

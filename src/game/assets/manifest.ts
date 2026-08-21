@@ -14,6 +14,7 @@ export type SpecialEffectKind =
   | "fishing-trap"
   | "barbell"
   | "rasengan"
+  | "kamehameha"
   | "mango-projectile"
   | "satellite-strike";
 export type VfxKey =
@@ -57,6 +58,22 @@ export type SpecialAssetManifest = {
     sourceFacing?: "left" | "right";
   }[];
   specialFrameCount?: number;
+  beamAsset?: {
+    key: string;
+    path: string;
+    sourceFacing?: "left" | "right";
+  };
+  chargeAsset?: {
+    key: string;
+    path: string;
+    sourceFacing?: "left" | "right";
+    displayWidth?: number;
+    displayHeight?: number;
+    offsetX?: number;
+    offsetY?: number;
+    offsetXByFrame?: number[];
+    offsetYByFrame?: number[];
+  };
   projectileAsset?: {
     key: string;
     path: string;
@@ -97,6 +114,7 @@ export type FighterAssetManifest = {
   };
   poses: Record<PoseName, PoseAsset>;
   frameAnimations?: Partial<Record<MovementAnimationName, FrameAnimationManifest>>;
+  throw?: ThrowAssetManifest;
   special: SpecialAssetManifest;
   voices: {
     attack: string[];
@@ -119,6 +137,19 @@ export type FrameAnimationManifest = {
   frameMs: number;
 };
 
+export type ThrowAssetManifest = {
+  frames: {
+    key: string;
+    path: string;
+    sourceFacing?: "left" | "right";
+  }[];
+  fallback: {
+    key: string;
+    path: string;
+    sourceFacing?: "left" | "right";
+  };
+};
+
 export type StageAssetManifest = {
   key: string;
   displayName: string;
@@ -136,6 +167,28 @@ export type MusicTrackManifest = {
 export type MenuLightningAssetManifest = {
   key: string;
   path: string;
+};
+
+export type RefereeIntroManifest = {
+  frames: {
+    key: string;
+    path: string;
+  }[];
+  aura: {
+    path: string;
+  };
+  audio?: {
+    key: string;
+    path: string;
+  };
+};
+
+export type EntranceVfxManifest = {
+  key: string;
+  displayName: string;
+  path: string;
+  width: number;
+  height: number;
 };
 
 export type VfxAssetManifest = {
@@ -228,6 +281,8 @@ const newFighterBase = (key: string) => `/assets/new_fighters/${key}`;
 const defaultSpecialFrameDurations = [...SPECIAL_FRAME_DURATIONS_MS];
 const defaultSpecialDurationMs = defaultSpecialFrameDurations.reduce((total, duration) => total + duration, 0);
 const defaultSpecialHitAtMs = defaultSpecialFrameDurations.slice(0, 3).reduce((total, duration) => total + duration, 0);
+const markKamehamehaFrameDurationsMs = [700, 2200, 7100, 4000, 500] as const;
+const markKamehamehaReleaseMs = markKamehamehaFrameDurationsMs.slice(0, 3).reduce((total, duration) => total + duration, 0);
 
 function specialFrameNumbers(frameCount: number) {
   return Array.from({ length: frameCount }, (_value, index) => index + 1);
@@ -360,6 +415,26 @@ function frameAnimationFromFiles(
   };
 }
 
+function throwFrames(
+  fighterKey: string,
+  sourceFacing: "left" | "right",
+  basePath = fighterBase(fighterKey),
+  filenames = ["frame_01.png", "frame_02.png", "frame_03.png"],
+): ThrowAssetManifest {
+  return {
+    frames: filenames.map((filename, index) => ({
+      key: `${fighterKey}-throw-frame-${index + 1}`,
+      path: `${basePath}/throw/${filename}`,
+      sourceFacing,
+    })),
+    fallback: {
+      key: `${fighterKey}-throw-fallback`,
+      path: `${basePath}/throw.png`,
+      sourceFacing,
+    },
+  };
+}
+
 function special(
   fighterKey: string,
   name: string,
@@ -397,6 +472,8 @@ function framedSpecial(
   specialBaseFacing?: "left" | "right",
   frameBasePath = `${fighterBase(fighterKey)}/${folder}`,
   specialFrameCount = 5,
+  frameFilePrefix = "frame_",
+  frameFilePad = 0,
 ): SpecialAssetManifest {
   const frameDurationsMs = frameDurationsForCount(specialFrameCount);
   return {
@@ -409,7 +486,7 @@ function framedSpecial(
     },
     frameAssets: specialFrameNumbers(specialFrameCount).map((frame) => ({
       key: `${fighterKey}-special-frame-${frame}`,
-      path: `${frameBasePath}/frame_${frame}.png`,
+      path: `${frameBasePath}/${frameFilePrefix}${String(frame).padStart(frameFilePad, "0")}.png`,
     })),
     specialFrameCount,
     frameDurationsMs,
@@ -458,6 +535,7 @@ export const fighterManifests: FighterAssetManifest[] = [
       idle: frameAnimation("esleigue", "idle", 4, 250, "idle_frames", "esleigue_idle", "right"),
       walk: frameAnimation("esleigue", "walk", 8, 115, "walk_frames", "esleigue_walk", "right"),
     },
+    throw: throwFrames("esleigue", "right"),
     special: framedSpecial("esleigue", "Super Esleigue", "super-flight", "special_esleigue", 780, 360, false, "right"),
     voices: {
       attack: [`${fighterBase("esleigue")}/bananasaynomre.ogg`],
@@ -501,6 +579,7 @@ export const fighterManifests: FighterAssetManifest[] = [
       idle: frameAnimation("karlo", "idle", 4, 250, "idle_frames", "karlo_idle", "left"),
       walk: frameAnimation("karlo", "walk", 8, 115, "walk_frames", "karlo_walk", "left"),
     },
+    throw: throwFrames("karlo", "right", fighterBase("karlo"), ["frame_01.png", "frame_02.png", "new_frame_3.png"]),
     special: framedSpecial("karlo", "Incredible Karlo", "ground-smash", "special_karlo", 190, 430, false, "right"),
     voices: {
       attack: [`${fighterBase("karlo")}/water food please.m4a`],
@@ -540,6 +619,7 @@ export const fighterManifests: FighterAssetManifest[] = [
       idle: frameAnimation("idjao", "idle", 4, 250, "idle_frames", "idjao_idle"),
       walk: frameAnimation("idjao", "walk", 6, 120, "walk_frames", "idjao_walk"),
     },
+    throw: throwFrames("idjao", "right"),
     special: framedSpecial("idjao", "Black Wigo Rush", "car-rush", "special_idjao", 860, 390, true, "right"),
     voices: {
       attack: [`${fighterBase("idjao")}/what after I saved u.m4a`],
@@ -579,6 +659,7 @@ export const fighterManifests: FighterAssetManifest[] = [
       idle: frameAnimation("dellomas", "idle", 4, 250, "idle_frames", "dellomas_idle", "left"),
       walk: frameAnimation("dellomas", "walk", 5, 120, "walk_frames", "dellomas_walk", "right"),
     },
+    throw: throwFrames("dellomas", "right"),
     special: framedSpecial("dellomas", "Fishing Rod Trap", "fishing-trap", "dellomas_special", 360, 270, false, "right"),
     voices: {
       attack: [`${fighterBase("dellomas")}/F.  I judge For The Croc.m4a`],
@@ -619,6 +700,7 @@ export const fighterManifests: FighterAssetManifest[] = [
       dash: frameAnimationFromFiles("vince", "dash", 90, "dash", ["frame_02.png", "frame_03.png", "frame_04.png"], "right"),
       backdash: frameAnimationFromFiles("vince", "backdash", 90, "backdash", ["frame_02.png", "frame_03.png", "frame_04.png"], "right"),
     },
+    throw: throwFrames("vince", "right"),
     special: framedSpecial("vince", "One-Hand Barbell", "barbell", "special_vince", 190, 450, false, "right"),
     voices: {
       attack: [`${fighterBase("vince")}/five judges.m4a`],
@@ -635,7 +717,7 @@ export const fighterManifests: FighterAssetManifest[] = [
     movementAnimation: "walk",
     portrait: {
       key: "mark-portrait",
-      path: `${fighterBase("mark")}/portrait.png`,
+      path: `${fighterBase("mark")}/use_this_new_portrait.png`,
     },
     scale: 1,
     body: {
@@ -658,14 +740,53 @@ export const fighterManifests: FighterAssetManifest[] = [
       idle: frameAnimation("mark", "idle", 4, 250, "idle_frames", "mark_idle", "left"),
       walk: frameAnimation("mark", "walk", 4, 120, "idle_frames", "mark_idle", "left"),
     },
+    throw: throwFrames("mark", "right"),
     special: {
-      ...framedSpecial("mark", "Rasengan", "rasengan", "special_mark", 260, 380, false, "right", "/assets/vfx/mark_special"),
+      ...framedSpecial(
+        "mark",
+        "Kamehameha",
+        "kamehameha",
+        "special_mark",
+        760,
+        420,
+        false,
+        "right",
+        `${fighterBase("mark")}/special`,
+        5,
+        "frame_",
+        2,
+      ),
+      asset: {
+        key: "mark-special",
+        path: `${fighterBase("mark")}/special/frame_01.png`,
+        sourceFacing: "right",
+      },
+      beamAsset: {
+        key: "mark-kamehameha-beam",
+        path: `${fighterBase("mark")}/special/kameha.gif`,
+        sourceFacing: "right",
+      },
+      chargeAsset: {
+        key: "mark-kamehameha-charge",
+        path: `${fighterBase("mark")}/special/KAMEHAMEHA CHARGE.gif`,
+        sourceFacing: "right",
+        displayWidth: 165,
+        displayHeight: 165,
+        offsetX: -82,
+        offsetY: -132,
+        offsetXByFrame: [-82, -64, -82],
+        offsetYByFrame: [-132, -138, -132],
+      },
+      frameDurationsMs: [...markKamehamehaFrameDurationsMs],
+      durationMs: markKamehamehaFrameDurationsMs.reduce((total, duration) => total + duration, 0),
+      hitAtMs: markKamehamehaReleaseMs,
+      impactFrame: 4,
     },
     voices: {
       attack: [`${fighterBase("mark")}/lizzzz.m4a`],
       hurt: [`${fighterBase("mark")}/lizzzz.m4a`],
       ko: [`${fighterBase("mark")}/lizzzz.m4a`],
-      special: [`${fighterBase("mark")}/special_mark/onlybinay.MP3`, `${fighterBase("mark")}/lizzzz.m4a`],
+      special: [`${fighterBase("mark")}/special/goku_kamehameha_wave.mp3`],
     },
   },
   {
@@ -717,6 +838,7 @@ export const fighterManifests: FighterAssetManifest[] = [
         newFighterBase("hernandez"),
       ),
     },
+    throw: throwFrames("hernandez", "right", newFighterBase("hernandez")),
     special: {
       ...framedSpecial(
         "hernandez",
@@ -795,6 +917,7 @@ export const fighterManifests: FighterAssetManifest[] = [
         newFighterBase("gerald"),
       ),
     },
+    throw: throwFrames("gerald", "right", newFighterBase("gerald")),
     special: {
       ...framedSpecial(
         "gerald",
@@ -837,6 +960,8 @@ export const sfxManifest = {
 } as const;
 
 export const extraSfxManifest = {
+  spawnEntrance: { key: "sfx-spawn-entrance", path: "/assets/sfx/tp_sound.mp3" },
+  refereeAura: { key: "sfx-referee-aura", path: "/assets/referee/super_saiyan_aura.mp3" },
   karloExplosion: { key: "sfx-karlo-explosion", path: "/assets/fighters/karlo/special_karlo/explosion.mp3" },
   geraldExplosion: { key: "sfx-gerald-explosion", path: "/assets/new_fighters/gerald/special/explosion.mp3" },
   idjaoCarCrash: { key: "sfx-idjao-car-crash", path: "/assets/character_sfx/idjao/car_crash.mp3" },
@@ -857,6 +982,40 @@ export const extraSfxManifest = {
     { key: "sfx-round-announcement-5", path: "/assets/sfx/round_announcements/round_5.mp3" },
   ],
 } as const;
+
+export const refereeIntroManifest: RefereeIntroManifest = {
+  frames: Array.from({ length: 6 }, (_value, index) => ({
+    key: `referee-round-frame-${index + 1}`,
+    path: `/assets/referee/frame_${index + 1}.png`,
+  })),
+  aura: {
+    path: "/assets/referee/aura.gif",
+  },
+};
+
+export const entranceVfxManifests: EntranceVfxManifest[] = [
+  {
+    key: "tornado-animation",
+    displayName: "Tornado Animation",
+    path: "/assets/entrance/tornado_animation.gif",
+    width: 290,
+    height: 380,
+  },
+  {
+    key: "blue-portal",
+    displayName: "Blue Portal",
+    path: "/assets/entrance/blue_portal.gif",
+    width: 230,
+    height: 380,
+  },
+  {
+    key: "purple-thunder-entrance",
+    displayName: "Purple Thunder",
+    path: "/assets/entrance/purplethunder_for_entrance.gif",
+    width: 290,
+    height: 380,
+  },
+];
 
 export const vfxAssetManifests: VfxAssetManifest[] = [
   {
@@ -931,6 +1090,7 @@ export const specialVfxManifest: Record<SpecialEffectKind, VfxConfig> = {
   "fishing-trap": { assetKey: "impact", displayWidth: 138, displayHeight: 120, offsetY: -12, flipWithFacing: true },
   barbell: { assetKey: "big-hit", displayWidth: 190, displayHeight: 184, offsetY: 0, flipWithFacing: true },
   rasengan: { assetKey: "charged", displayWidth: 172, displayHeight: 196, offsetY: -14, flipWithFacing: true },
+  kamehameha: { assetKey: "impact", displayWidth: 190, displayHeight: 156, offsetY: -12, flipWithFacing: true },
   "mango-projectile": { assetKey: "charged", displayWidth: 150, displayHeight: 170, offsetY: -20, flipWithFacing: true },
   "satellite-strike": { assetKey: "explosion2", displayWidth: 240, displayHeight: 230, offsetY: 26 },
 };
@@ -943,6 +1103,12 @@ export function allFrameAnimationAssets(): { key: string; path: string; sourceFa
   return fighterManifests.filter(isFighterPlayable).flatMap((fighter) =>
     Object.values(fighter.frameAnimations ?? {}).flatMap((animation) => animation?.frames ?? []),
   );
+}
+
+export function allThrowAssets(): { key: string; path: string; sourceFacing?: "left" | "right" }[] {
+  return fighterManifests
+    .filter(isFighterPlayable)
+    .flatMap((fighter) => (fighter.throw ? [...fighter.throw.frames, fighter.throw.fallback] : []));
 }
 
 export function allSpecialAssets(): { key: string; path: string }[] {
@@ -959,6 +1125,8 @@ export function allPortraitAssets(): { key: string; path: string; sourceFacing?:
 
 export function allExtraSfxAssets(): { key: string; path: string }[] {
   return [
+    extraSfxManifest.spawnEntrance,
+    extraSfxManifest.refereeAura,
     extraSfxManifest.karloExplosion,
     extraSfxManifest.geraldExplosion,
     extraSfxManifest.idjaoCarCrash,
