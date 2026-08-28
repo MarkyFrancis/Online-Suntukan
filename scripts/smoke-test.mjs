@@ -6,6 +6,10 @@ import { join, resolve } from "node:path";
 const root = resolve(".");
 const screenshotPath = join(root, ".tmp", "karlo-throw-smoke.png");
 const refereeScreenshotPath = join(root, ".tmp", "referee-intro-smoke.png");
+const videoStageScreenshotPath = join(root, ".tmp", "dragon-temple-video-smoke.png");
+const smokeWindowSize = process.env.SMOKE_WINDOW_SIZE ?? "1920,1080";
+const smokeDebugPort = process.env.SMOKE_DEBUG_PORT ?? "9223";
+const smokeRunId = process.env.SMOKE_RUN_ID ?? "default";
 const chromeCandidates = [
   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
   "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
@@ -18,17 +22,17 @@ if (!chromePath) {
   throw new Error("Chrome or Edge was not found for headless smoke testing.");
 }
 
-const userDataDir = join(root, ".tmp", "chrome-smoke");
+const userDataDir = join(root, ".tmp", `chrome-smoke-${smokeRunId}`);
 mkdirSync(userDataDir, { recursive: true });
 
 const browser = spawn(chromePath, [
   "--headless=new",
   "--disable-gpu",
-  "--window-size=1920,1080",
+  `--window-size=${smokeWindowSize}`,
   "--no-first-run",
   "--no-default-browser-check",
   "--disable-background-networking",
-  "--remote-debugging-port=9223",
+  `--remote-debugging-port=${smokeDebugPort}`,
   `--user-data-dir=${userDataDir}`,
   "about:blank",
 ]);
@@ -60,7 +64,7 @@ function fetchJson(url) {
 async function getDebuggerUrl() {
   for (let i = 0; i < 40; i += 1) {
     try {
-      const targets = await fetchJson("http://127.0.0.1:9223/json/list");
+      const targets = await fetchJson(`http://127.0.0.1:${smokeDebugPort}/json/list`);
       const page = targets.find((target) => target.type === "page" && target.webSocketDebuggerUrl);
       if (page) {
         return page.webSocketDebuggerUrl;
@@ -280,6 +284,27 @@ try {
   const screenshot = await client.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });
   writeFileSync(screenshotPath, Buffer.from(screenshot.data, "base64"));
 
+  const videoStageVisual = await evaluate(`(async () => {
+    const scene = window.__bsuFighterGame?.scene?.getScene("BattleScene");
+    scene.startMatch({ mode: "pvp", p1FighterKey: "esleigue", p2FighterKey: "karlo", stageKey: "dragon-temple" }, true);
+    const deadline = Date.now() + 30000;
+    while (scene.matchAssetLoadInProgress && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 3300));
+    const snapshot = scene.sim.snapshot;
+    const camera = scene.cameras.main;
+    return {
+      p1X: snapshot.fighters.p1.x,
+      p2X: snapshot.fighters.p2.x,
+      midpoint: (snapshot.fighters.p1.x + snapshot.fighters.p2.x) / 2,
+      cameraCenter: camera.scrollX + camera.displayWidth / 2,
+      refereeVisible: Boolean(document.querySelector(".referee-intro-sprite")),
+    };
+  })()`);
+  const videoStageScreenshot = await client.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });
+  writeFileSync(videoStageScreenshotPath, Buffer.from(videoStageScreenshot.data, "base64"));
+
   const report = await evaluate(`(async () => {
     const scene = window.__bsuFighterGame?.scene?.getScene("BattleScene");
     const empty = () => ({ left: false, right: false, jump: false, punch: false, punch2: false, kick: false, throw: false, special: false, block: false });
@@ -290,8 +315,13 @@ try {
       }
       scene.syncViews(scene.sim.snapshot);
     };
-    const fresh = async (p1FighterKey = "karlo", p2FighterKey = "karlo", mode = "pvp") => {
-      scene.startMatch({ mode, p1FighterKey, p2FighterKey, stageKey: "bsu-cartoon" }, true);
+    const fresh = async (
+      p1FighterKey = "karlo",
+      p2FighterKey = "karlo",
+      mode = "pvp",
+      stageKey = "bsu-cartoon",
+    ) => {
+      scene.startMatch({ mode, p1FighterKey, p2FighterKey, stageKey }, true);
       const deadline = Date.now() + 30000;
       while (scene.matchAssetLoadInProgress && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 20));
@@ -327,6 +357,111 @@ try {
       return { p1, p2 };
     };
     const completeThrow = () => tick(1950);
+
+    await fresh("karlo", "esleigue");
+    scene.cleanupRefereeRoundIntro();
+    const assistFighters = position(430, 530);
+    assistFighters.p1.assistMeter = 100;
+    tick(16, { ...empty(), assist: true });
+    const assistStarted = {
+      phase: snapshot().assistSequence.phase,
+      meter: snapshot().fighters.p1.assistMeter,
+      hasActor: Boolean(scene.assistView),
+      timerMs: snapshot().timerMs,
+    };
+    tick(700);
+    const assistActive = {
+      phase: snapshot().assistSequence.phase,
+      hasActor: Boolean(scene.assistView),
+      timerMs: snapshot().timerMs,
+    };
+    scene.sim.cancelSpecialSequence();
+    scene.cleanupAssist();
+    scene.syncViews(snapshot());
+    const assistCleanup = {
+      phase: snapshot().assistSequence.phase,
+      hasActor: Boolean(scene.assistView),
+      timerUnchangedDuringCall: assistActive.timerMs === assistStarted.timerMs,
+    };
+
+    await fresh("karlo", "esleigue");
+    scene.cleanupRefereeRoundIntro();
+    position(1040, 1700);
+    scene.updateBattleCamera(snapshot(), true, 16);
+    const cameraRight = scene.cameras.main.scrollX;
+    position(500, 1000);
+    scene.updateBattleCamera(snapshot(), true, 16);
+    const cameraLeft = scene.cameras.main.scrollX;
+    position(200, 2200);
+    tick(16);
+    const constrainedSeparation = Math.abs(snapshot().fighters.p2.x - snapshot().fighters.p1.x);
+    const stageScroll = {
+      stageWidth: scene.currentStageWidth,
+      visibleWorldWidth: scene.cameras.main.worldView.width,
+      cameraRight,
+      cameraLeft,
+      constrainedSeparation,
+      maxSeparation: 760,
+      stageBounds: {
+        p1: snapshot().fighters.p1.x,
+        p2: snapshot().fighters.p2.x,
+      },
+    };
+
+    await fresh("karlo", "esleigue", "pvp", "dragon-temple");
+    scene.cleanupRefereeRoundIntro();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const video = scene.stageVideo;
+    const videoStyle = video ? getComputedStyle(video) : null;
+    const videoInitialSnapshot = scene.sim.snapshot;
+    const videoInitialMidpoint = (videoInitialSnapshot.fighters.p1.x + videoInitialSnapshot.fighters.p2.x) / 2;
+    const videoInitialCameraCenter = scene.cameras.main.scrollX + scene.cameras.main.displayWidth / 2;
+    const videoStage = {
+      stageWidth: scene.currentStageWidth,
+      stageHeight: scene.currentStageHeight,
+      groundY: scene.currentGroundY,
+      scrolling: scene.currentStageScrolling,
+      visibleWorldWidth: scene.cameras.main.displayWidth,
+      initialMidpoint: videoInitialMidpoint,
+      initialCameraCenter: videoInitialCameraCenter,
+      hasVideo: Boolean(video),
+      videoWidth: video?.videoWidth ?? 0,
+      videoHeight: video?.videoHeight ?? 0,
+      readyState: video?.readyState ?? 0,
+      mediaError: video?.error?.code ?? null,
+      muted: video?.muted ?? false,
+      loop: video?.loop ?? false,
+      objectFit: videoStyle?.objectFit ?? "",
+      zIndex: videoStyle?.zIndex ?? "",
+    };
+    scene.cleanupSpawnEntrance();
+    scene.playRefereeRoundIntro(1);
+    await new Promise((resolve) => setTimeout(resolve, 2050));
+    const videoRefereeNode = document.querySelector(".referee-intro-sprite");
+    const videoRefereeRect = videoRefereeNode?.getBoundingClientRect();
+    const videoStageRootRect = document.querySelector("#game-root")?.getBoundingClientRect();
+    videoStage.referee = {
+      active: scene.roundIntroActive,
+      hasNode: Boolean(videoRefereeNode),
+      left: videoRefereeRect && videoStageRootRect ? videoRefereeRect.left - videoStageRootRect.left : null,
+      right: videoRefereeRect && videoStageRootRect ? videoRefereeRect.right - videoStageRootRect.left : null,
+      top: videoRefereeRect && videoStageRootRect ? videoRefereeRect.top - videoStageRootRect.top : null,
+      bottom: videoRefereeRect && videoStageRootRect ? videoRefereeRect.bottom - videoStageRootRect.top : null,
+      viewportWidth: videoStageRootRect?.width ?? 0,
+      viewportHeight: videoStageRootRect?.height ?? 0,
+    };
+    scene.cleanupRefereeRoundIntro();
+    const videoStageFighters = position(900, 1300);
+    scene.updateBattleCamera(snapshot(), true, 16);
+    const videoCameraLeft = scene.cameras.main.scrollX;
+    videoStageFighters.p1.x = 2700;
+    videoStageFighters.p2.x = 3100;
+    scene.updateBattleCamera(snapshot(), true, 16);
+    const videoCameraRight = scene.cameras.main.scrollX;
+    const videoCameraScrollY = scene.cameras.main.scrollY;
+    videoStage.cameraLeft = videoCameraLeft;
+    videoStage.cameraRight = videoCameraRight;
+    videoStage.cameraScrollY = videoCameraScrollY;
 
     await fresh();
     const motionFighters = position(430, 530);
@@ -552,12 +687,16 @@ try {
       rosterThrowsRight,
       cpuThrow: cpuInput.throw,
       refereeRoundNumbers,
+      assistSmoke: { started: assistStarted, active: assistActive, cleanup: assistCleanup },
+      stageScroll,
+      videoStage,
     };
   })()`);
 
   report.visualThrow = visualThrow;
   report.refereeIntro = { during: refereeIntroDuring, after: refereeIntroAfter, screenshotPath: refereeScreenshotPath };
   report.screenshotPath = screenshotPath;
+  report.videoStageVisual = { ...videoStageVisual, screenshotPath: videoStageScreenshotPath };
 
   if (
     report.screen !== "playing" ||
@@ -566,7 +705,7 @@ try {
     report.controls.p2Throw !== 73 ||
     report.visualThrow.grabbedTexture !== "karlo-hurt" ||
     report.visualThrow.liftedTexture !== "karlo-hurt" ||
-    report.visualThrow.liftedPose.y >= 474 ||
+    report.visualThrow.liftedPose.y >= 492 ||
     Math.abs(report.visualThrow.liftedPose.angle) < 15 ||
     report.throwMotion.pull.texture !== "karlo-hurt" ||
     report.throwMotion.pull.x >= report.throwMotion.defenderStartX ||
@@ -575,7 +714,7 @@ try {
     Math.abs(report.throwMotion.lift.angle) < 15 ||
     report.throwMotion.slam.texture !== "karlo-ko" ||
     Math.abs(report.throwMotion.slam.angle) < 45 ||
-    report.throwMotion.slam.y !== 474 ||
+    report.throwMotion.slam.y !== 492 ||
     report.throwMotion.slam.health !== 182 ||
     report.throwMotion.slideStart.targetX === null ||
     report.throwMotion.slideStart.targetX <= report.throwMotion.slideStart.x ||
@@ -613,6 +752,45 @@ try {
     Math.abs(report.cleanup.p1.angle) > 0.01 ||
     Math.abs(report.cleanup.p2.angle) > 0.01 ||
     !report.cpuThrow ||
+    report.assistSmoke.started.phase !== "entrance" ||
+    report.assistSmoke.started.meter !== 0 ||
+    !report.assistSmoke.started.hasActor ||
+    report.assistSmoke.started.timerMs <= 0 ||
+    report.assistSmoke.active.phase !== "active" ||
+    !report.assistSmoke.active.hasActor ||
+    report.assistSmoke.cleanup.phase !== "idle" ||
+    report.assistSmoke.cleanup.hasActor ||
+    !report.assistSmoke.cleanup.timerUnchangedDuringCall ||
+    report.stageScroll.stageWidth <= report.stageScroll.visibleWorldWidth ||
+    report.stageScroll.cameraRight <= report.stageScroll.cameraLeft ||
+    report.stageScroll.constrainedSeparation > report.stageScroll.maxSeparation + 0.01 ||
+    report.videoStage.stageWidth !== 1920 ||
+    report.videoStage.stageHeight !== 540 ||
+    report.videoStage.groundY !== 506 ||
+    !report.videoStage.scrolling ||
+    !report.videoStage.hasVideo ||
+    report.videoStage.readyState < 2 ||
+    report.videoStage.mediaError !== null ||
+    !report.videoStage.muted ||
+    !report.videoStage.loop ||
+    report.videoStage.objectFit !== "contain" ||
+    !report.videoStage.referee.active ||
+    !report.videoStage.referee.hasNode ||
+    report.videoStage.referee.left === null ||
+    report.videoStage.referee.right === null ||
+    report.videoStage.referee.top === null ||
+    report.videoStage.referee.bottom === null ||
+    report.videoStage.referee.right < 0 ||
+    report.videoStage.referee.left > report.videoStage.referee.viewportWidth ||
+    report.videoStage.referee.bottom < 0 ||
+    report.videoStage.referee.top > report.videoStage.referee.viewportHeight ||
+    report.videoStage.cameraRight <= report.videoStage.cameraLeft ||
+    report.videoStage.cameraLeft < 0 ||
+    report.videoStage.cameraRight > report.videoStage.stageWidth - report.videoStage.visibleWorldWidth + 0.01 ||
+    report.videoStage.cameraScrollY !== 0 ||
+    Math.abs(report.videoStage.initialCameraCenter - report.videoStage.initialMidpoint) > 1 ||
+    Math.abs(report.videoStageVisual.cameraCenter - report.videoStageVisual.midpoint) > 1 ||
+    !report.videoStageVisual.refereeVisible ||
     report.rosterThrows.length !== 8 ||
     report.rosterThrowsRight.length !== 8 ||
     report.rosterThrows.some((throwResult) =>

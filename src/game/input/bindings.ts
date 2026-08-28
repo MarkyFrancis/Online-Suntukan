@@ -9,6 +9,7 @@ export type PlayerInput = {
   kick: boolean;
   throw: boolean;
   special: boolean;
+  assist: boolean;
   block: boolean;
 };
 
@@ -21,12 +22,15 @@ export const emptyInput = (): PlayerInput => ({
   kick: false,
   throw: false,
   special: false,
+  assist: false,
   block: false,
 });
 
+type KeyboardAction = Exclude<keyof PlayerInput, "punch2" | "assist">;
+
 export type KeyboardBindings = {
-  p1: Record<Exclude<keyof PlayerInput, "punch2">, Phaser.Input.Keyboard.Key>;
-  p2: Record<Exclude<keyof PlayerInput, "punch2">, Phaser.Input.Keyboard.Key>;
+  p1: Record<KeyboardAction, Phaser.Input.Keyboard.Key>;
+  p2: Record<KeyboardAction, Phaser.Input.Keyboard.Key>;
 };
 
 export function createKeyboardBindings(scene: Phaser.Scene): KeyboardBindings {
@@ -60,7 +64,7 @@ export function createKeyboardBindings(scene: Phaser.Scene): KeyboardBindings {
   };
 }
 
-export function readInput(keys: Record<Exclude<keyof PlayerInput, "punch2">, Phaser.Input.Keyboard.Key>): PlayerInput {
+export function readInput(keys: Record<KeyboardAction, Phaser.Input.Keyboard.Key>): PlayerInput {
   return {
     left: keys.left.isDown,
     right: keys.right.isDown,
@@ -70,6 +74,7 @@ export function readInput(keys: Record<Exclude<keyof PlayerInput, "punch2">, Pha
     kick: Phaser.Input.Keyboard.JustDown(keys.kick),
     throw: Phaser.Input.Keyboard.JustDown(keys.throw),
     special: Phaser.Input.Keyboard.JustDown(keys.special),
+    assist: false,
     block: keys.block.isDown,
   };
 }

@@ -5,6 +5,7 @@ import {
   SPECIAL_IMPACT_HOLD_MS,
   SPECIAL_RECOVERY_MS,
 } from "../config/attacks";
+import type { StageBackgroundScaleMode } from "../config/stage";
 
 export type PoseName = "idle" | "jump" | "punch" | "punch2" | "kick" | "hurt" | "block" | "ko";
 export type SpecialEffectKind =
@@ -155,6 +156,18 @@ export type StageAssetManifest = {
   displayName: string;
   path: string;
   floorY?: number;
+  groundY?: number;
+  type?: "image" | "video";
+  videoPath?: string;
+  fitMode?: "cover" | "fill" | "contain";
+  /** Explicitly enables horizontal camera travel for wide stages. */
+  scrolling?: boolean;
+  stageWidth?: number;
+  stageHeight?: number;
+  /** Camera center limits in world units. */
+  cameraMinX?: number;
+  cameraMaxX?: number;
+  backgroundScaleMode?: StageBackgroundScaleMode;
   usesDomBackground?: boolean;
 };
 
@@ -214,40 +227,96 @@ export const stageManifests: StageAssetManifest[] = [
   {
     key: "bsu-cartoon",
     displayName: "BSU Cartoon",
-    path: "/assets/stage/bsu_cartoon.jfif",
+    path: "/assets/stage/bsu_cartoon_3840x1080.jpg",
+    stageWidth: 1920,
+    stageHeight: 540,
+    cameraMinX: 480,
+    cameraMaxX: 1440,
+    backgroundScaleMode: "cover",
   },
   {
     key: "taal",
     displayName: "Taal",
-    path: "/assets/stage/taal.jpg",
+    path: "/assets/stage/taal_3840x1080.jpg",
     floorY: 502,
+    stageWidth: 1920,
+    stageHeight: 540,
+    cameraMinX: 480,
+    cameraMaxX: 1440,
+    backgroundScaleMode: "cover",
   },
   {
     key: "tanaun-church",
     displayName: "Tanauan Church",
-    path: "/assets/stage/tanaunchurch.jpg",
+    path: "/assets/stage/tanaunchurch_3840x1080.jpg",
     floorY: 502,
+    stageWidth: 1920,
+    stageHeight: 540,
+    cameraMinX: 480,
+    cameraMaxX: 1440,
+    backgroundScaleMode: "cover",
   },
   {
     key: "dragon-temple",
-    displayName: "Dragon Temple",
-    path: "/assets/stages/Dragon Temple.gif",
+    displayName: "Dragon Temple (Wide Video)",
+    path: "/assets/stages/new_resize_Dragon_temple.gif",
+    // The source video is 3840x1080. Map it 2:1 into the battle coordinate
+    // system so the full video height is visible without cropping or warping.
+    // This still gives the arena two full 960px battle screens of travel.
     floorY: 488,
     usesDomBackground: true,
+    type: "video",
+    videoPath: "/assets/stages/dragon-temple.mp4",
+    fitMode: "contain",
+    scrolling: true,
+    stageWidth: 1920,
+    stageHeight: 540,
+    cameraMinX: 480,
+    cameraMaxX: 1440,
+    backgroundScaleMode: "cover",
   },
   {
     key: "nigh-forest",
-    displayName: "Nigh Forest",
-    path: "/assets/stages/Nigh Forest.gif",
+    displayName: "Night Forest (Video)",
+    path: "/assets/stages/Nightforest Rezize.gif",
     floorY: 488,
     usesDomBackground: true,
+    type: "video",
+    videoPath: "/assets/stages/night-forest.mp4",
+    fitMode: "contain",
+    scrolling: true,
+    stageWidth: 1920,
+    stageHeight: 540,
+    cameraMinX: 480,
+    cameraMaxX: 1440,
+    backgroundScaleMode: "cover",
   },
   {
     key: "samurai-stage",
-    displayName: "Samurai Stage",
+    displayName: "Samurai Stage (Video)",
     path: "/assets/stages/Samurai Stage.gif",
     floorY: 488,
     usesDomBackground: true,
+    type: "video",
+    videoPath: "/assets/stages/samurai-stage.mp4",
+    fitMode: "contain",
+    scrolling: true,
+    stageWidth: 1920,
+    stageHeight: 540,
+    cameraMinX: 480,
+    cameraMaxX: 1440,
+    backgroundScaleMode: "cover",
+  },
+  {
+    key: "gym",
+    displayName: "Gym",
+    path: "/assets/stages/gym.jpg",
+    floorY: 502,
+    stageWidth: 1920,
+    stageHeight: 540,
+    cameraMinX: 480,
+    cameraMaxX: 1440,
+    backgroundScaleMode: "cover",
   },
 ];
 
@@ -965,6 +1034,7 @@ export const extraSfxManifest = {
   karloExplosion: { key: "sfx-karlo-explosion", path: "/assets/fighters/karlo/special_karlo/explosion.mp3" },
   geraldExplosion: { key: "sfx-gerald-explosion", path: "/assets/new_fighters/gerald/special/explosion.mp3" },
   idjaoCarCrash: { key: "sfx-idjao-car-crash", path: "/assets/character_sfx/idjao/car_crash.mp3" },
+  round1Fight: { key: "sfx-mk-round-1-fight", path: "/assets/sfx/round_announcements/mk_round_1_fight_gong.mp3" },
   selectionComplete: [
     { key: "sfx-selection-complete-1", path: "/assets/sfx/selection_complete/complete_1.mp3" },
     { key: "sfx-selection-complete-2", path: "/assets/sfx/selection_complete/complete_2.mp3" },
@@ -1130,6 +1200,7 @@ export function allExtraSfxAssets(): { key: string; path: string }[] {
     extraSfxManifest.karloExplosion,
     extraSfxManifest.geraldExplosion,
     extraSfxManifest.idjaoCarCrash,
+    extraSfxManifest.round1Fight,
     ...extraSfxManifest.selectionComplete,
     ...extraSfxManifest.roundOver,
     ...extraSfxManifest.roundAnnouncements,

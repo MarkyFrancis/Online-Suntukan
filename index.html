@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
     <title>BSU ONLINE SUNTUKAN</title>
   </head>
   <body>
@@ -28,9 +28,10 @@
           <div class="title-actions">
             <button id="title-pvp" type="button">PVP</button>
             <button id="title-pvc" type="button">PVC</button>
+            <button id="title-mobile" type="button">Mobile VS CPU</button>
             <button id="title-settings" type="button">Settings</button>
           </div>
-          <p>F starts PVP - K starts PVC - M opens Settings</p>
+          <p>F PVP - K PVC - V Mobile VS CPU - M Settings</p>
         </section>
 
         <section id="settings-menu" class="settings-menu hidden" aria-label="Settings menu">
@@ -52,27 +53,31 @@
         <section id="character-select" class="character-select hidden" aria-label="Character select">
           <div class="select-topline">
             <span id="select-mode-label">PVP</span>
+            <strong id="select-step-label">CHOOSE MAIN FIGHTER</strong>
             <span>Best of 5 · First to 3</span>
           </div>
           <div class="versus-layout">
-            <div class="big-preview p1-preview">
-              <span class="player-tag">P1</span>
-              <img id="p1-preview-img" alt="" />
+              <div class="big-preview p1-preview">
+                <span class="player-tag">P1</span>
+                <img id="p1-main-portrait" class="main-portrait-thumb" alt="" />
+                <img id="p1-preview-img" alt="" />
               <strong id="p1-preview-name">Player 1</strong>
               <span id="p1-ready" class="ready-tag">Choosing</span>
             </div>
             <div class="versus-burst">VS</div>
-            <div class="big-preview p2-preview">
-              <span id="p2-label" class="player-tag">P2</span>
-              <img id="p2-preview-img" alt="" />
+              <div class="big-preview p2-preview">
+                <span id="p2-label" class="player-tag">P2</span>
+                <img id="p2-main-portrait" class="main-portrait-thumb" alt="" />
+                <img id="p2-preview-img" alt="" />
               <strong id="p2-preview-name">Player 2</strong>
               <span id="p2-ready" class="ready-tag">Choosing</span>
             </div>
           </div>
           <div id="fighter-grid" class="fighter-grid" role="grid" aria-label="Fighter grid"></div>
+          <button id="character-back" class="screen-back" type="button">Back</button>
           <div class="control-strip">
-            <span>P1: A/D move - W jump - S block - F punch - F,F combo - G kick - T throw</span>
-            <span>P2/CPU: Arrows move - Down block - K punch - K,K combo - L kick - I throw</span>
+            <span>P1: A/D move - W jump - S block - F punch - G kick - T throw - H special / H,H partner</span>
+            <span>P2/CPU: Arrows move - Down block - K punch - L kick - I throw - O special / O,O partner</span>
             <span>Enter: continue</span>
           </div>
         </section>
@@ -81,6 +86,7 @@
           <h2>Choose Stage</h2>
           <div id="stage-grid" class="stage-grid" role="grid" aria-label="Stage grid"></div>
           <div id="stage-name" class="stage-name">Stage</div>
+          <button id="stage-back" class="screen-back" type="button">Back</button>
           <div class="control-strip">
             <span>A/D or Arrows: choose stage</span>
             <span>F/K/Enter/Space: fight</span>
@@ -99,6 +105,11 @@
               <div id="p1-special" class="special-fill p1"></div>
               <span id="p1-special-label" class="special-label">SPECIAL</span>
             </div>
+            <div class="assist-frame">
+              <img id="p1-assist-portrait" class="assist-portrait" alt="" />
+              <div id="p1-assist" class="assist-fill p1"></div>
+              <span id="p1-assist-label" class="assist-label">PARTNER</span>
+            </div>
           </div>
           <div class="center-hud">
             <div id="timer" class="timer">60</div>
@@ -114,11 +125,52 @@
               <div id="p2-special" class="special-fill p2"></div>
               <span id="p2-special-label" class="special-label">SPECIAL</span>
             </div>
+            <div class="assist-frame">
+              <img id="p2-assist-portrait" class="assist-portrait" alt="" />
+              <div id="p2-assist" class="assist-fill p2"></div>
+              <span id="p2-assist-label" class="assist-label">PARTNER</span>
+            </div>
           </div>
         </div>
 
         <div id="round-banner" class="round-banner hidden">
           <span id="round-message"></span>
+        </div>
+
+        <div id="mobile-controls" class="mobile-controls hidden" aria-label="Touch controls">
+          <div class="mobile-orientation" role="status">Rotate your phone for best experience</div>
+          <button id="mobile-pause" class="mobile-pause-button" type="button" aria-label="Pause">II</button>
+          <div class="mobile-control-deck">
+            <div class="touch-cluster touch-movement" aria-label="Movement controls">
+              <span class="touch-cluster-caption" aria-hidden="true">MOVE</span>
+              <button class="touch-control touch-hold touch-left" data-touch-action="left" data-touch-skin="left" type="button" aria-label="Move left">
+                <span class="touch-glyph" aria-hidden="true">&#9664;</span><span class="touch-label">LEFT</span>
+              </button>
+              <button class="touch-control touch-hold touch-right" data-touch-action="right" data-touch-skin="right" type="button" aria-label="Move right">
+                <span class="touch-glyph" aria-hidden="true">&#9654;</span><span class="touch-label">RIGHT</span>
+              </button>
+              <button class="touch-control touch-press touch-jump" data-touch-action="jump" data-touch-skin="up" type="button" aria-label="Jump">
+                <span class="touch-glyph" aria-hidden="true">&#9650;</span><span class="touch-label">JUMP</span>
+              </button>
+              <button class="touch-control touch-hold touch-down" data-touch-action="block" data-touch-skin="down" type="button" aria-label="Block">
+                <span class="touch-glyph" aria-hidden="true">&#9660;</span><span class="touch-label">BLOCK</span>
+              </button>
+            </div>
+            <div class="touch-cluster touch-actions" aria-label="Attack controls">
+              <button class="touch-control touch-press touch-punch" data-touch-action="punch" data-touch-skin="punch" type="button" aria-label="Punch">
+                <span class="touch-glyph" aria-hidden="true">&#9633;</span><span class="touch-label">PUNCH</span>
+              </button>
+              <button class="touch-control touch-press touch-kick" data-touch-action="kick" data-touch-skin="kick" type="button" aria-label="Kick">
+                <span class="touch-glyph" aria-hidden="true">&#10005;</span><span class="touch-label">KICK</span>
+              </button>
+              <button class="touch-control touch-press touch-throw" data-touch-action="throw" data-touch-skin="throw" type="button" aria-label="Throw">
+                <span class="touch-glyph" aria-hidden="true">&#9675;</span><span class="touch-label">THROW</span>
+              </button>
+              <button class="touch-control touch-press touch-special" data-touch-action="special" data-touch-skin="ss-partner" type="button" aria-label="Special or Partner">
+                <span class="touch-glyph" aria-hidden="true">&#9651;</span><span class="touch-label">SS / PARTNER</span>
+              </button>
+            </div>
+          </div>
         </div>
 
         <section id="pause-menu" class="pause-menu hidden" aria-label="Pause menu">

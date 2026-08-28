@@ -9,8 +9,11 @@ type GameWindow = Window & {
 const config: Phaser.Types.Core.GameConfig = {
   type: Phaser.AUTO,
   parent: "game-root",
-  width: 1920,
-  height: 1080,
+  // The battle always uses this fixed 16:9 coordinate space. The surrounding
+  // game frame scales it uniformly, keeping camera framing and spawn positions
+  // stable when a browser panel changes size.
+  width: 960,
+  height: 540,
   backgroundColor: "rgba(0, 0, 0, 0)",
   transparent: true,
   pixelArt: false,
@@ -24,7 +27,7 @@ const config: Phaser.Types.Core.GameConfig = {
     createContainer: true,
   },
   scale: {
-    mode: Phaser.Scale.ENVELOP,
+    mode: Phaser.Scale.FIT,
     autoCenter: Phaser.Scale.CENTER_BOTH,
   },
   scene: [BattleScene],

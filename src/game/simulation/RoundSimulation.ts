@@ -15,6 +15,13 @@ import {
   SPECIAL_METER_TAKE_GAIN,
   SPECIAL_METER_TIME_GAIN_PER_SECOND,
   SPECIAL_RECOVERY_MS,
+  ASSIST_ENTRANCE_MS,
+  ASSIST_METER_BLOCK_TAKE_GAIN,
+  ASSIST_METER_DEAL_GAIN,
+  ASSIST_METER_TAKE_GAIN,
+  ASSIST_METER_TIME_GAIN_PER_SECOND,
+  ASSIST_SPECIAL_BLOCK_DAMAGE,
+  ASSIST_SPECIAL_DAMAGE,
   HIT_STUN_REHIT_REDUCTION,
   HIT_STUN_REHIT_THRESHOLD_MS,
   PUNCH2_COMBO_WINDOW_MS,
@@ -30,11 +37,18 @@ import {
 } from "../config/attacks";
 import type { PlayerInput } from "../input/bindings";
 import { emptyInput } from "../input/bindings";
-import type { FighterId, FighterState, GameMode, RoundSnapshot, SpecialSequenceState, ThrowSequenceState } from "./types";
+import { stageWorldDefaults } from "../config/stage";
+import type {
+  AssistSequenceState,
+  FighterId,
+  FighterState,
+  GameMode,
+  RoundSnapshot,
+  SpecialSequenceState,
+  ThrowSequenceState,
+} from "./types";
 
 const defaultGroundY = 474;
-const stageLeft = 72;
-const stageRight = 888;
 const gravity = 1850;
 const jumpVelocity = -720;
 const moveSpeed = 270;
@@ -56,16 +70,28 @@ export type RoundEvents = {
   onThrowStart?: (attacker: FighterState, victim: FighterState, success: boolean) => void;
   onThrowImpact?: (attacker: FighterState, victim: FighterState) => void;
   onThrowEnd?: () => void;
+  onAssistStart?: (caller: FighterState, victim: FighterState, assist: FighterAssetManifest) => void;
+  onAssistHit?: (caller: FighterState, victim: FighterState, assist: FighterAssetManifest) => void;
+  onAssistEnd?: () => void;
   onKo?: (winner: FighterId | "draw") => void;
 };
 
 export type RoundOptions = {
   groundY?: number;
+  stageWidth?: number;
+  stageLeft?: number;
+  stageRight?: number;
+  maxFighterSeparation?: number;
+  assistSpecials?: Partial<Record<FighterId, FighterAssetManifest>>;
 };
 
 export class RoundSimulation {
   private snapshotValue: RoundSnapshot;
   private readonly groundY: number;
+  private readonly stageLeft: number;
+  private readonly stageRight: number;
+  private readonly maxFighterSeparation: number;
+  private readonly assistSpecials: Partial<Record<FighterId, FighterAssetManifest>>;
 
   constructor(
     mode: GameMode,
@@ -75,17 +101,27 @@ export class RoundSimulation {
     options: RoundOptions = {},
   ) {
     this.groundY = options.groundY ?? defaultGroundY;
+    const stageWidth = options.stageWidth ?? stageWorldDefaults.stageWidth;
+    this.stageLeft = options.stageLeft ?? stageWorldDefaults.edgePadding;
+    this.stageRight = options.stageRight ?? stageWidth - stageWorldDefaults.edgePadding;
+    this.maxFighterSeparation = options.maxFighterSeparation ?? stageWorldDefaults.maxFighterSeparation;
+    this.assistSpecials = options.assistSpecials ?? {};
+    // Keep the opening pair in the central play area of wide stages while
+    // leaving enough room for both fighters to approach each other.
+    const startOffset = Math.min(160, (this.stageRight - this.stageLeft) / 3);
+    const stageCenter = (this.stageLeft + this.stageRight) / 2;
     this.snapshotValue = {
       mode,
       status: "playing",
       winner: null,
       timerMs: roundLengthMs,
       fighters: {
-        p1: this.createFighter("p1", p1Def, 260, 1),
-        p2: this.createFighter("p2", p2Def, 700, -1),
+        p1: this.createFighter("p1", p1Def, stageCenter - startOffset, 1),
+        p2: this.createFighter("p2", p2Def, stageCenter + startOffset, -1),
       },
       specialSequence: this.createIdleSpecialSequence(),
       throwSequence: this.createIdleThrowSequence(),
+      assistSequence: this.createIdleAssistSequence(),
     };
   }
 
@@ -111,10 +147,20 @@ export class RoundSimulation {
     }
     this.snapshotValue.specialSequence = this.createIdleSpecialSequence();
     this.snapshotValue.throwSequence = this.createIdleThrowSequence();
+    this.snapshotValue.assistSequence = this.createIdleAssistSequence();
+    this.events.onAssistEnd?.();
   }
 
   update(dtMs: number, inputs: { p1: PlayerInput; p2: PlayerInput }) {
     if (this.snapshotValue.status !== "playing") {
+      return;
+    }
+
+    if (this.snapshotValue.assistSequence.phase !== "idle") {
+      this.updateAssistSequence(dtMs);
+      this.updateFacing();
+      this.updatePoses();
+      this.checkEndState();
       return;
     }
 
@@ -139,18 +185,24 @@ export class RoundSimulation {
 
     this.updateFighter(this.snapshotValue.fighters.p1, inputs.p1, dt, dtMs);
     if (
-      this.snapshotValue.throwSequence.phase === "idle" ||
-      !this.snapshotValue.throwSequence.success
+      (this.snapshotValue.throwSequence.phase === "idle" || !this.snapshotValue.throwSequence.success) &&
+      this.snapshotValue.assistSequence.phase === "idle"
     ) {
       this.updateFighter(this.snapshotValue.fighters.p2, inputs.p2, dt, dtMs);
     }
     this.updateFacing();
+    if (this.snapshotValue.assistSequence.phase !== "idle") {
+      this.updatePoses();
+      this.checkEndState();
+      return;
+    }
     if (this.snapshotValue.throwSequence.phase !== "idle") {
       this.updatePoses();
       this.checkEndState();
       return;
     }
     this.resolveBodyPush();
+    this.clampFighterSeparation();
     this.resolveAttack(this.snapshotValue.fighters.p1, this.snapshotValue.fighters.p2);
     this.resolveAttack(this.snapshotValue.fighters.p2, this.snapshotValue.fighters.p1);
     this.updatePoses();
@@ -178,6 +230,17 @@ export class RoundSimulation {
       impactApplied: false,
       slideStartX: null,
       slideTargetX: null,
+    };
+  }
+
+  private createIdleAssistSequence(): AssistSequenceState {
+    return {
+      phase: "idle",
+      callerId: null,
+      victimId: null,
+      elapsedMs: 0,
+      phaseElapsedMs: 0,
+      hasHit: false,
     };
   }
 
@@ -209,6 +272,7 @@ export class RoundSimulation {
       },
       activeAttack: null,
       specialMeter: 0,
+      assistMeter: 0,
     };
   }
 
@@ -223,6 +287,10 @@ export class RoundSimulation {
       fighter.specialMeter = Math.min(
         SPECIAL_METER_MAX,
         fighter.specialMeter + SPECIAL_METER_TIME_GAIN_PER_SECOND * dt,
+      );
+      fighter.assistMeter = Math.min(
+        SPECIAL_METER_MAX,
+        fighter.assistMeter + ASSIST_METER_TIME_GAIN_PER_SECOND * dt,
       );
     }
 
@@ -259,6 +327,8 @@ export class RoundSimulation {
         this.tryStartAttack(fighter, "kick");
       } else if (input.throw) {
         this.tryStartThrow(fighter);
+      } else if (input.assist) {
+        this.tryStartAssist(fighter);
       } else if (input.special) {
         this.tryStartSpecial(fighter);
       }
@@ -267,7 +337,7 @@ export class RoundSimulation {
     }
 
     fighter.vy += gravity * dt;
-    fighter.x = Phaser.Math.Clamp(fighter.x + fighter.vx * dt, stageLeft, stageRight);
+    fighter.x = Phaser.Math.Clamp(fighter.x + fighter.vx * dt, this.stageLeft, this.stageRight);
     fighter.y += fighter.vy * dt;
 
     if (fighter.y >= this.groundY) {
@@ -350,6 +420,46 @@ export class RoundSimulation {
       hasHit: false,
     };
     this.events.onSpecialStart?.(fighter, victim);
+  }
+
+  private tryStartAssist(fighter: FighterState) {
+    const assist = this.assistSpecials[fighter.id];
+    if (
+      !assist ||
+      fighter.assistMeter < SPECIAL_METER_MAX ||
+      fighter.activeAttack ||
+      fighter.blocking ||
+      !fighter.grounded ||
+      fighter.hitStunMs > 0 ||
+      fighter.health <= 0 ||
+      this.snapshotValue.specialSequence.phase !== "idle" ||
+      this.snapshotValue.throwSequence.phase !== "idle" ||
+      this.snapshotValue.assistSequence.phase !== "idle"
+    ) {
+      return;
+    }
+
+    const victimId: FighterId = fighter.id === "p1" ? "p2" : "p1";
+    const victim = this.snapshotValue.fighters[victimId];
+    if (victim.health <= 0) {
+      return;
+    }
+
+    fighter.assistMeter = 0;
+    fighter.vx = 0;
+    fighter.vy = 0;
+    victim.vx = 0;
+    victim.vy = 0;
+    victim.activeAttack = null;
+    this.snapshotValue.assistSequence = {
+      phase: "entrance",
+      callerId: fighter.id,
+      victimId,
+      elapsedMs: 0,
+      phaseElapsedMs: 0,
+      hasHit: false,
+    };
+    this.events.onAssistStart?.(fighter, victim, assist);
   }
 
   private tryStartThrow(fighter: FighterState) {
@@ -473,12 +583,14 @@ export class RoundSimulation {
           victim.vx = caster.facing * THROW_KNOCKBACK;
           victim.specialMeter = Math.min(SPECIAL_METER_MAX, victim.specialMeter + SPECIAL_METER_TAKE_GAIN);
           caster.specialMeter = Math.min(SPECIAL_METER_MAX, caster.specialMeter + Math.max(1, SPECIAL_METER_DEAL_GAIN * 0.55));
+          victim.assistMeter = Math.min(SPECIAL_METER_MAX, victim.assistMeter + ASSIST_METER_TAKE_GAIN);
+          caster.assistMeter = Math.min(SPECIAL_METER_MAX, caster.assistMeter + ASSIST_METER_DEAL_GAIN * 0.55);
           victim.pose = victim.health <= 0 ? "ko" : "hurt";
           sequence.slideStartX = victim.x;
           sequence.slideTargetX = Phaser.Math.Clamp(
             victim.x + caster.facing * THROW_KNOCKBACK,
-            stageLeft,
-            stageRight,
+            this.stageLeft,
+            this.stageRight,
           );
           this.events.onThrowImpact?.(caster, victim);
           this.advanceThrowPhase("recovery");
@@ -568,6 +680,95 @@ export class RoundSimulation {
     }
   }
 
+  private updateAssistSequence(dtMs: number) {
+    const sequence = this.snapshotValue.assistSequence;
+    if (sequence.phase === "idle" || !sequence.callerId || !sequence.victimId) {
+      return;
+    }
+
+    const caller = this.snapshotValue.fighters[sequence.callerId];
+    const victim = this.snapshotValue.fighters[sequence.victimId];
+    const assist = this.assistSpecials[sequence.callerId];
+    if (!assist) {
+      this.snapshotValue.assistSequence = this.createIdleAssistSequence();
+      this.events.onAssistEnd?.();
+      return;
+    }
+
+    caller.vx = 0;
+    caller.vy = 0;
+    victim.vx = 0;
+    victim.vy = 0;
+    caller.blocking = false;
+    victim.blocking = false;
+    sequence.elapsedMs += dtMs;
+    sequence.phaseElapsedMs += dtMs;
+
+    if (sequence.phase === "entrance") {
+      if (sequence.phaseElapsedMs >= ASSIST_ENTRANCE_MS) {
+        sequence.phase = "active";
+        sequence.phaseElapsedMs = 0;
+      }
+      return;
+    }
+
+    if (sequence.phase === "active") {
+      const activeMs = Math.max(1, assist.special.durationMs);
+      if (!sequence.hasHit && sequence.phaseElapsedMs >= Math.min(assist.special.hitAtMs, activeMs - 1)) {
+        sequence.hasHit = true;
+        this.applyAssistImpact(caller, victim, assist);
+      }
+      if (sequence.phaseElapsedMs >= activeMs) {
+        sequence.phase = "impact";
+        sequence.phaseElapsedMs = 0;
+      }
+      return;
+    }
+
+    if (sequence.phase === "impact") {
+      if (sequence.phaseElapsedMs >= (assist.special.impactHoldMs ?? specialImpactHoldMs)) {
+        sequence.phase = "recovery";
+        sequence.phaseElapsedMs = 0;
+      }
+      return;
+    }
+
+    if (sequence.phase === "recovery" && sequence.phaseElapsedMs >= (assist.special.recoveryMs ?? SPECIAL_RECOVERY_MS)) {
+      this.snapshotValue.assistSequence = this.createIdleAssistSequence();
+      this.events.onAssistEnd?.();
+    }
+  }
+
+  private applyAssistImpact(caller: FighterState, victim: FighterState, assist: FighterAssetManifest) {
+    const special = assist.special;
+    const horizontalDistance = Math.abs(victim.x - caller.x);
+    const victimInFront = caller.facing === 1 ? victim.x >= caller.x - 8 : victim.x <= caller.x + 8;
+    const verticalOverlap = Math.abs(victim.y - caller.y) <= special.height;
+    const inRange = (special.fullScreen || horizontalDistance <= special.range) && victimInFront && verticalOverlap;
+    if (!inRange || victim.health <= 0) {
+      return;
+    }
+
+    if (victim.blocking && victim.grounded && victim.facing === -caller.facing) {
+      victim.health = Math.max(0, victim.health - ASSIST_SPECIAL_BLOCK_DAMAGE);
+      victim.assistMeter = Math.min(SPECIAL_METER_MAX, victim.assistMeter + ASSIST_METER_BLOCK_TAKE_GAIN);
+      victim.hitStunMs = this.nextHitStun(victim, SPECIAL_BLOCK_STUN_MS);
+      victim.vx = caller.facing * (special.knockback * blockMoveMultiplier);
+      victim.pose = victim.health <= 0 ? "ko" : "block";
+      this.events.onBlock?.(caller, victim, "kick");
+      return;
+    }
+
+    victim.health = Math.max(0, victim.health - ASSIST_SPECIAL_DAMAGE);
+    caller.assistMeter = Math.min(SPECIAL_METER_MAX, caller.assistMeter + ASSIST_METER_DEAL_GAIN);
+    victim.assistMeter = Math.min(SPECIAL_METER_MAX, victim.assistMeter + ASSIST_METER_TAKE_GAIN);
+    victim.hitStunMs = this.nextHitStun(victim, SPECIAL_HIT_STUN_MS);
+    victim.vx = caller.facing * special.knockback;
+    victim.vy = special.effect === "ground-smash" ? -250 : victim.vy;
+    victim.pose = victim.health <= 0 ? "ko" : "hurt";
+    this.events.onAssistHit?.(caller, victim, assist);
+  }
+
   private getSpecialActiveMs(caster: FighterState) {
     const framePacedMinimum = Math.ceil(6 * (1000 / SPECIAL_ANIMATION_FRAME_RATE));
     return Math.max(caster.def.special.durationMs, framePacedMinimum);
@@ -592,6 +793,7 @@ export class RoundSimulation {
     if (victim.blocking && victim.grounded && victim.facing === -attacker.facing) {
       victim.health = Math.max(0, victim.health - SPECIAL_BLOCK_DAMAGE);
       victim.specialMeter = Math.min(SPECIAL_METER_MAX, victim.specialMeter + SPECIAL_METER_BLOCK_TAKE_GAIN);
+      victim.assistMeter = Math.min(SPECIAL_METER_MAX, victim.assistMeter + ASSIST_METER_BLOCK_TAKE_GAIN);
       victim.hitStunMs = this.nextHitStun(victim, SPECIAL_BLOCK_STUN_MS);
       victim.vx = attacker.facing * (special.knockback * blockMoveMultiplier);
       victim.pose = victim.health <= 0 ? "ko" : "block";
@@ -605,6 +807,7 @@ export class RoundSimulation {
     victim.vy = special.effect === "ground-smash" ? -250 : victim.vy;
     victim.pose = victim.health <= 0 ? "ko" : "hurt";
     victim.specialMeter = Math.min(SPECIAL_METER_MAX, victim.specialMeter + SPECIAL_METER_TAKE_GAIN);
+    victim.assistMeter = Math.min(SPECIAL_METER_MAX, victim.assistMeter + ASSIST_METER_TAKE_GAIN);
     this.events.onSpecialHit?.(attacker, victim);
   }
 
@@ -628,8 +831,23 @@ export class RoundSimulation {
 
     const push = overlap / 2;
     const direction = distance >= 0 ? 1 : -1;
-    p1.x = Phaser.Math.Clamp(p1.x - direction * push, stageLeft, stageRight);
-    p2.x = Phaser.Math.Clamp(p2.x + direction * push, stageLeft, stageRight);
+    p1.x = Phaser.Math.Clamp(p1.x - direction * push, this.stageLeft, this.stageRight);
+    p2.x = Phaser.Math.Clamp(p2.x + direction * push, this.stageLeft, this.stageRight);
+  }
+
+  private clampFighterSeparation() {
+    const p1 = this.snapshotValue.fighters.p1;
+    const p2 = this.snapshotValue.fighters.p2;
+    const distance = Math.abs(p2.x - p1.x);
+    const excess = distance - this.maxFighterSeparation;
+    if (excess <= 0) {
+      return;
+    }
+
+    const direction = p2.x >= p1.x ? 1 : -1;
+    const halfExcess = excess / 2;
+    p1.x = Phaser.Math.Clamp(p1.x + direction * halfExcess, this.stageLeft, this.stageRight);
+    p2.x = Phaser.Math.Clamp(p2.x - direction * halfExcess, this.stageLeft, this.stageRight);
   }
 
   private resolveAttack(attacker: FighterState, victim: FighterState) {
@@ -673,6 +891,8 @@ export class RoundSimulation {
       victim.health = Math.max(0, victim.health - config.blockDamage);
       attacker.specialMeter = Math.min(SPECIAL_METER_MAX, attacker.specialMeter + Math.max(1, SPECIAL_METER_BLOCKED_DEAL_GAIN * 0.5));
       victim.specialMeter = Math.min(SPECIAL_METER_MAX, victim.specialMeter + Math.max(1, SPECIAL_METER_BLOCK_TAKE_GAIN * 0.5));
+      attacker.assistMeter = Math.min(SPECIAL_METER_MAX, attacker.assistMeter + ASSIST_METER_DEAL_GAIN * 0.35);
+      victim.assistMeter = Math.min(SPECIAL_METER_MAX, victim.assistMeter + ASSIST_METER_BLOCK_TAKE_GAIN * 0.35);
       victim.hitStunMs = this.nextHitStun(victim, config.blockStunMs);
       victim.vx = attacker.facing * (config.knockback * 0.42);
       victim.pose = victim.health <= 0 ? "ko" : "block";
@@ -683,6 +903,8 @@ export class RoundSimulation {
     victim.health = Math.max(0, victim.health - config.damage);
     attacker.specialMeter = Math.min(SPECIAL_METER_MAX, attacker.specialMeter + SPECIAL_METER_DEAL_GAIN);
     victim.specialMeter = Math.min(SPECIAL_METER_MAX, victim.specialMeter + SPECIAL_METER_TAKE_GAIN);
+    attacker.assistMeter = Math.min(SPECIAL_METER_MAX, attacker.assistMeter + ASSIST_METER_DEAL_GAIN);
+    victim.assistMeter = Math.min(SPECIAL_METER_MAX, victim.assistMeter + ASSIST_METER_TAKE_GAIN);
     victim.hitStunMs = this.nextHitStun(victim, config.hitStunMs);
     victim.vx = attacker.facing * config.knockback;
     victim.pose = victim.health <= 0 ? "ko" : "hurt";
@@ -699,6 +921,7 @@ export class RoundSimulation {
   private updatePoses() {
     const sequence = this.snapshotValue.specialSequence;
     const throwSequence = this.snapshotValue.throwSequence;
+    const assistSequence = this.snapshotValue.assistSequence;
     for (const fighter of Object.values(this.snapshotValue.fighters)) {
       if (fighter.health <= 0) {
         fighter.pose = "ko";
@@ -708,10 +931,14 @@ export class RoundSimulation {
         fighter.pose = "hurt";
       } else if (sequence.phase !== "idle" && sequence.casterId === fighter.id) {
         fighter.pose = "idle";
+      } else if (fighter.hitStunMs > 0) {
+        // A Partner special freezes the normal pose loop, but the victim must
+        // still show the hit/hurt texture during its impact stun.
+        fighter.pose = "hurt";
+      } else if (assistSequence.phase !== "idle") {
+        fighter.pose = "idle";
       } else if (fighter.blocking) {
         fighter.pose = "block";
-      } else if (fighter.hitStunMs > 0) {
-        fighter.pose = "hurt";
       } else if (fighter.activeAttack) {
         fighter.pose = fighter.activeAttack.config.name;
       } else if (!fighter.grounded) {

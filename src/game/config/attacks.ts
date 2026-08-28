@@ -10,6 +10,15 @@ export const SPECIAL_METER_DEAL_GAIN = 16;
 export const SPECIAL_METER_BLOCKED_DEAL_GAIN = 8;
 export const SPECIAL_METER_TAKE_GAIN = 12;
 export const SPECIAL_METER_BLOCK_TAKE_GAIN = 7;
+export const ASSIST_CHARGE_TIME_MULTIPLIER = 2;
+export const ASSIST_SPECIAL_DAMAGE = 30;
+export const ASSIST_SPECIAL_BLOCK_DAMAGE = 9;
+export const ASSIST_METER_TIME_GAIN_PER_SECOND = SPECIAL_METER_TIME_GAIN_PER_SECOND / ASSIST_CHARGE_TIME_MULTIPLIER;
+export const ASSIST_METER_DEAL_GAIN = SPECIAL_METER_DEAL_GAIN / ASSIST_CHARGE_TIME_MULTIPLIER;
+export const ASSIST_METER_TAKE_GAIN = SPECIAL_METER_TAKE_GAIN / ASSIST_CHARGE_TIME_MULTIPLIER;
+export const ASSIST_METER_BLOCK_TAKE_GAIN = SPECIAL_METER_BLOCK_TAKE_GAIN / ASSIST_CHARGE_TIME_MULTIPLIER;
+export const ASSIST_ENTRANCE_MS = 650;
+export const ASSIST_EXIT_MS = 320;
 export const SPECIAL_INTRO_PAUSE_MS = 800;
 export const SPECIAL_NAME_DISPLAY_MS = 900;
 export const SPECIAL_ANIMATION_FRAME_RATE = 6;
@@ -20,6 +29,9 @@ export const SPECIAL_FRAME_MS = 500;
 export const HIT_STUN_REHIT_REDUCTION = 0.45;
 export const HIT_STUN_REHIT_THRESHOLD_MS = 90;
 export const PUNCH2_COMBO_WINDOW_MS = 350;
+export const SS_PARTNER_DOUBLE_TAP_MS = 350;
+// Kept as an alias for any older callers while the mobile control uses the clearer name.
+export const SPECIAL_DOUBLE_TAP_WINDOW_MS = SS_PARTNER_DOUBLE_TAP_MS;
 
 // Throws are intentionally close-range and block-breaking, but leave a clear whiff window.
 export const THROW_RANGE = 60;

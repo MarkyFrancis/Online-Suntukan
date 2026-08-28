@@ -13,6 +13,7 @@ export type AiDifficulty = {
   punishChance: number;
   throwChance: number;
   throwRange: number;
+  assistChance: number;
 };
 
 export const aiDifficulty: AiDifficulty = {
@@ -30,4 +31,5 @@ export const aiDifficulty: AiDifficulty = {
   punishChance: 0.38,
   throwChance: 0.28,
   throwRange: 60,
+  assistChance: 0.16,
 };

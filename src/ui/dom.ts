@@ -10,22 +10,43 @@ export type RoundSelection = {
   mode: GameMode;
   p1FighterKey: string;
   p2FighterKey: string;
+  p1AssistKey: string;
+  p2AssistKey: string;
   stageKey: string;
 };
 
+export type SelectStep = "main" | "assist";
+
 export type SelectSnapshot = {
   mode: GameMode;
+  step: SelectStep;
   p1Index: number;
   p2Index: number;
   p1Locked: boolean;
   p2Locked: boolean;
+  p1AssistIndex: number;
+  p2AssistIndex: number;
+  p1AssistLocked: boolean;
+  p2AssistLocked: boolean;
 };
 
 export type MatchScore = Record<FighterId, number>;
 export type PauseAction = "resume" | "restart-round" | "character-select" | "stage-select" | "main-menu";
+export type TouchAction =
+  | "left"
+  | "right"
+  | "jump"
+  | "punch"
+  | "kick"
+  | "block"
+  | "throw"
+  | "special"
+  | "assist";
+export type TouchPhase = "down" | "up";
 
 type UiCallbacks = {
   chooseMode: (mode: GameMode) => void;
+  chooseMobileMode: () => void;
   previewSelection: (selection: Omit<RoundSelection, "mode">) => void;
   startMatch: (selection: RoundSelection) => void;
   changeMusic: (delta: number) => void;
@@ -34,12 +55,19 @@ type UiCallbacks = {
   pauseAction: (action: PauseAction) => void;
   restartMatch: () => void;
   mainMenu: () => void;
+  selectFighter: (index: number) => void;
+  backFromCharacters: () => void;
+  backFromStage: () => void;
+  touchAction: (action: TouchAction, phase: TouchPhase) => void;
+  mobilePause: () => void;
+  unlockAudio: () => void;
 };
 
 type UiElements = {
   titleScreen: HTMLElement;
   titlePvp: HTMLButtonElement;
   titlePvc: HTMLButtonElement;
+  titleMobile: HTMLButtonElement;
   titleSettings: HTMLButtonElement;
   settingsMenu: HTMLElement;
   settingsClose: HTMLButtonElement;
@@ -48,17 +76,22 @@ type UiElements = {
   musicChoice: HTMLElement;
   characterSelect: HTMLElement;
   selectModeLabel: HTMLElement;
+  selectStepLabel: HTMLElement;
   fighterGrid: HTMLElement;
   p1PreviewImg: HTMLImageElement;
   p2PreviewImg: HTMLImageElement;
+  p1MainPortrait: HTMLImageElement;
+  p2MainPortrait: HTMLImageElement;
   p1PreviewName: HTMLElement;
   p2PreviewName: HTMLElement;
   p1Ready: HTMLElement;
   p2Ready: HTMLElement;
   p2Label: HTMLElement;
+  characterBack: HTMLButtonElement;
   stageScreen: HTMLElement;
   stageGrid: HTMLElement;
   stageName: HTMLElement;
+  stageBack: HTMLButtonElement;
   restartButton: HTMLButtonElement;
   p1Name: HTMLElement;
   p2Name: HTMLElement;
@@ -68,6 +101,12 @@ type UiElements = {
   p2Special: HTMLElement;
   p1SpecialLabel: HTMLElement;
   p2SpecialLabel: HTMLElement;
+  p1AssistPortrait: HTMLImageElement;
+  p2AssistPortrait: HTMLImageElement;
+  p1Assist: HTMLElement;
+  p2Assist: HTMLElement;
+  p1AssistLabel: HTMLElement;
+  p2AssistLabel: HTMLElement;
   p1Rounds: HTMLElement;
   p2Rounds: HTMLElement;
   timer: HTMLElement;
@@ -79,6 +118,21 @@ type UiElements = {
   matchWinnerTitle: HTMLElement;
   restartMatch: HTMLButtonElement;
   winnerMainMenu: HTMLButtonElement;
+  mobileControls: HTMLElement;
+  mobilePause: HTMLButtonElement;
+};
+
+type TouchSkin = "left" | "right" | "up" | "down" | "punch" | "kick" | "throw" | "ss-partner";
+
+const touchSkinCandidates: Record<TouchSkin, string[]> = {
+  left: ["left.png", "dpad-left.png", "arrow-left.png"],
+  right: ["right.png", "dpad-right.png", "arrow-right.png"],
+  up: ["up.png", "dpad-up.png", "arrow-up.png", "jump.png"],
+  down: ["down.png", "dpad-down.png", "arrow-down.png", "block.png"],
+  punch: ["punch.png", "button-punch.png"],
+  kick: ["kick.png", "button-kick.png"],
+  throw: ["throw.png", "button-throw.png"],
+  "ss-partner": ["ss-partner.png", "ss_partner.png", "special-partner.png", "triangle.png"],
 };
 
 const pauseItems: { label: string; action: PauseAction }[] = [
@@ -94,6 +148,8 @@ export class DomUi {
   private selectedStageIndex = 0;
   private pauseIndex = 0;
   private currentSelection: RoundSelection;
+  private mobileMode = false;
+  private touchSkinsRequested = false;
 
   constructor(
     private readonly callbacks: UiCallbacks,
@@ -107,13 +163,19 @@ export class DomUi {
       mode: "pvp",
       p1FighterKey: firstFighter,
       p2FighterKey: fighters[1]?.key ?? firstFighter,
+      p1AssistKey: fighters[2]?.key ?? firstFighter,
+      p2AssistKey: fighters[3]?.key ?? fighters[1]?.key ?? firstFighter,
       stageKey: stages[0]?.key ?? "",
     };
     this.renderFighterGrid();
     this.renderStageGrid();
     this.renderPauseOptions();
+    this.elements.titlePvp.addEventListener("pointerdown", callbacks.unlockAudio, { passive: true });
+    this.elements.titlePvc.addEventListener("pointerdown", callbacks.unlockAudio, { passive: true });
+    this.elements.titleMobile.addEventListener("pointerdown", callbacks.unlockAudio, { passive: true });
     this.elements.titlePvp.addEventListener("click", () => callbacks.chooseMode("pvp"));
     this.elements.titlePvc.addEventListener("click", () => callbacks.chooseMode("pvc"));
+    this.elements.titleMobile.addEventListener("click", callbacks.chooseMobileMode);
     this.elements.titleSettings.addEventListener("click", callbacks.openSettings);
     this.elements.settingsClose.addEventListener("click", callbacks.closeSettings);
     this.elements.musicPrev.addEventListener("click", () => callbacks.changeMusic(-1));
@@ -121,6 +183,14 @@ export class DomUi {
     this.elements.restartButton.addEventListener("click", () => callbacks.pauseAction("restart-round"));
     this.elements.restartMatch.addEventListener("click", callbacks.restartMatch);
     this.elements.winnerMainMenu.addEventListener("click", callbacks.mainMenu);
+    this.elements.characterBack.addEventListener("click", callbacks.backFromCharacters);
+    this.elements.stageBack.addEventListener("click", callbacks.backFromStage);
+    this.elements.mobilePause.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      callbacks.unlockAudio();
+      callbacks.mobilePause();
+    });
+    this.bindTouchControls(callbacks);
   }
 
   showMainMenu() {
@@ -129,6 +199,7 @@ export class DomUi {
     this.elements.pauseMenu.classList.add("hidden");
     this.elements.matchWinner.classList.add("hidden");
     this.hideSettingsMenu();
+    this.setMobileControls(false);
   }
 
   showSettingsMenu() {
@@ -151,23 +222,52 @@ export class DomUi {
     this.updateCharacterSelect(snapshot);
   }
 
+  setMobileMode(enabled: boolean) {
+    this.mobileMode = enabled;
+    document.body.dataset.mobileMode = enabled ? "true" : "false";
+  }
+
+  setMobileControls(enabled: boolean, paused = false) {
+    const visible = enabled && this.mobileMode;
+    this.elements.mobileControls.classList.toggle("hidden", !visible);
+    this.elements.mobileControls.classList.toggle("paused", visible && paused);
+    if (visible && !this.touchSkinsRequested) {
+      this.touchSkinsRequested = true;
+      this.loadTouchControlSkins();
+    }
+  }
+
+  setAssistSelection(p1: FighterAssetManifest, p2: FighterAssetManifest) {
+    this.setPreviewImage(this.elements.p1AssistPortrait, p1);
+    this.setPreviewImage(this.elements.p2AssistPortrait, p2);
+  }
+
   updateCharacterSelect(snapshot: SelectSnapshot) {
-    const p1 = this.fighters[snapshot.p1Index] ?? this.fighters[0];
-    const p2 = this.fighters[snapshot.p2Index] ?? this.fighters[0];
+    const p1Main = this.fighters[snapshot.p1Index] ?? this.fighters[0];
+    const p2Main = this.fighters[snapshot.p2Index] ?? this.fighters[0];
+    const p1 = this.fighters[snapshot.step === "assist" ? snapshot.p1AssistIndex : snapshot.p1Index] ?? p1Main;
+    const p2 = this.fighters[snapshot.step === "assist" ? snapshot.p2AssistIndex : snapshot.p2Index] ?? p2Main;
     const p1Playable = isFighterPlayable(p1);
     const p2Playable = isFighterPlayable(p2);
-    this.elements.selectModeLabel.textContent = snapshot.mode.toUpperCase();
+    this.elements.selectModeLabel.textContent = this.mobileMode ? "MOBILE VS CPU" : snapshot.mode.toUpperCase();
+    this.elements.selectStepLabel.textContent = snapshot.step === "assist" ? "CHOOSE PARTNER" : "CHOOSE MAIN FIGHTER";
     this.elements.p2Label.textContent = snapshot.mode === "pvc" ? "CPU" : "P2";
     this.setPreviewImage(this.elements.p1PreviewImg, p1);
     this.setPreviewImage(this.elements.p2PreviewImg, p2);
+    this.setPreviewImage(this.elements.p1MainPortrait, p1Main);
+    this.setPreviewImage(this.elements.p2MainPortrait, p2Main);
     this.elements.p1PreviewImg.classList.toggle("source-right", (p1.portrait.sourceFacing ?? p1.baseFacing) === "right");
     this.elements.p2PreviewImg.classList.toggle("source-right", (p2.portrait.sourceFacing ?? p2.baseFacing) === "right");
+    this.elements.p1MainPortrait.classList.toggle("source-right", (p1Main.portrait.sourceFacing ?? p1Main.baseFacing) === "right");
+    this.elements.p2MainPortrait.classList.toggle("source-right", (p2Main.portrait.sourceFacing ?? p2Main.baseFacing) === "right");
     this.elements.p1PreviewName.textContent = p1.displayName;
     this.elements.p2PreviewName.textContent = p2.displayName;
-    this.elements.p1Ready.textContent = p1Playable ? (snapshot.p1Locked ? "Ready" : "Choosing") : "Coming Soon";
-    this.elements.p2Ready.textContent = p2Playable ? (snapshot.p2Locked ? "Ready" : "Choosing") : "Coming Soon";
-    this.elements.p1Ready.classList.toggle("ready", p1Playable && snapshot.p1Locked);
-    this.elements.p2Ready.classList.toggle("ready", p2Playable && snapshot.p2Locked);
+    const p1Locked = snapshot.step === "assist" ? snapshot.p1AssistLocked : snapshot.p1Locked;
+    const p2Locked = snapshot.step === "assist" ? snapshot.p2AssistLocked : snapshot.p2Locked;
+    this.elements.p1Ready.textContent = p1Playable ? (p1Locked ? "Ready" : "Choosing") : "Coming Soon";
+    this.elements.p2Ready.textContent = p2Playable ? (p2Locked ? "Ready" : "Choosing") : "Coming Soon";
+    this.elements.p1Ready.classList.toggle("ready", p1Playable && p1Locked);
+    this.elements.p2Ready.classList.toggle("ready", p2Playable && p2Locked);
     this.elements.p1Ready.classList.toggle("locked", !p1Playable);
     this.elements.p2Ready.classList.toggle("locked", !p2Playable);
     this.elements.p1PreviewImg.parentElement?.classList.toggle("preview-locked", !p1Playable);
@@ -176,10 +276,12 @@ export class DomUi {
     for (const button of this.elements.fighterGrid.querySelectorAll<HTMLButtonElement>(".fighter-cell")) {
       const index = Number(button.dataset.index ?? 0);
       const fighter = this.fighters[index];
-      button.classList.toggle("p1-cursor", index === snapshot.p1Index);
-      button.classList.toggle("p2-cursor", index === snapshot.p2Index);
-      button.classList.toggle("p1-locked", snapshot.p1Locked && index === snapshot.p1Index);
-      button.classList.toggle("p2-locked", snapshot.p2Locked && index === snapshot.p2Index);
+      const p1Index = snapshot.step === "assist" ? snapshot.p1AssistIndex : snapshot.p1Index;
+      const p2Index = snapshot.step === "assist" ? snapshot.p2AssistIndex : snapshot.p2Index;
+      button.classList.toggle("p1-cursor", index === p1Index);
+      button.classList.toggle("p2-cursor", index === p2Index);
+      button.classList.toggle("p1-locked", p1Locked && index === p1Index);
+      button.classList.toggle("p2-locked", p2Locked && index === p2Index);
       button.classList.toggle("locked", fighter ? !isFighterPlayable(fighter) : false);
     }
   }
@@ -227,6 +329,10 @@ export class DomUi {
       this.elements.p2Special.style.width = "0%";
       this.elements.p1SpecialLabel.textContent = "SPECIAL";
       this.elements.p2SpecialLabel.textContent = "SPECIAL";
+      this.elements.p1Assist.style.width = "0%";
+      this.elements.p2Assist.style.width = "0%";
+      this.elements.p1AssistLabel.textContent = "PARTNER";
+      this.elements.p2AssistLabel.textContent = "PARTNER";
       this.setBarState(this.elements.p1Health, false, "danger");
       this.setBarState(this.elements.p2Health, false, "danger");
       this.setBarState(this.elements.p1Special, false, "ready");
@@ -249,10 +355,18 @@ export class DomUi {
     this.elements.p2SpecialLabel.textContent = p2.specialMeter >= 100 ? "SPECIAL READY" : p2.def.special.name;
     this.elements.p1SpecialLabel.classList.toggle("ready", p1.specialMeter >= 100);
     this.elements.p2SpecialLabel.classList.toggle("ready", p2.specialMeter >= 100);
+    this.elements.p1Assist.style.width = `${Math.max(0, p1.assistMeter)}%`;
+    this.elements.p2Assist.style.width = `${Math.max(0, p2.assistMeter)}%`;
+    this.elements.p1AssistLabel.textContent = p1.assistMeter >= 100 ? "PARTNER READY" : "PARTNER";
+    this.elements.p2AssistLabel.textContent = p2.assistMeter >= 100 ? "PARTNER READY" : "PARTNER";
+    this.elements.p1AssistLabel.classList.toggle("ready", p1.assistMeter >= 100);
+    this.elements.p2AssistLabel.classList.toggle("ready", p2.assistMeter >= 100);
     this.setBarState(this.elements.p1Health, p1HealthRatio <= 0.28, "danger");
     this.setBarState(this.elements.p2Health, p2HealthRatio <= 0.28, "danger");
     this.setBarState(this.elements.p1Special, p1.specialMeter >= 100, "ready");
     this.setBarState(this.elements.p2Special, p2.specialMeter >= 100, "ready");
+    this.setBarState(this.elements.p1Assist, p1.assistMeter >= 100, "ready");
+    this.setBarState(this.elements.p2Assist, p2.assistMeter >= 100, "ready");
     this.elements.timer.textContent = `${Math.ceil(snapshot.timerMs / 1000)}`;
   }
 
@@ -331,6 +445,9 @@ export class DomUi {
       const label = document.createElement("span");
       label.textContent = fighter.displayName;
       button.append(img, label);
+      if (playable) {
+        button.addEventListener("click", () => this.callbacks.selectFighter(index));
+      }
       if (!playable) {
         const status = document.createElement("small");
         status.textContent = "Coming Soon";
@@ -429,6 +546,7 @@ export class DomUi {
       titleScreen: this.mustGet("title-screen"),
       titlePvp: this.mustGetButton("title-pvp"),
       titlePvc: this.mustGetButton("title-pvc"),
+      titleMobile: this.mustGetButton("title-mobile"),
       titleSettings: this.mustGetButton("title-settings"),
       settingsMenu: this.mustGet("settings-menu"),
       settingsClose: this.mustGetButton("settings-close"),
@@ -437,17 +555,22 @@ export class DomUi {
       musicChoice: this.mustGet("music-choice"),
       characterSelect: this.mustGet("character-select"),
       selectModeLabel: this.mustGet("select-mode-label"),
+      selectStepLabel: this.mustGet("select-step-label"),
       fighterGrid: this.mustGet("fighter-grid"),
       p1PreviewImg: this.mustGetImage("p1-preview-img"),
       p2PreviewImg: this.mustGetImage("p2-preview-img"),
+      p1MainPortrait: this.mustGetImage("p1-main-portrait"),
+      p2MainPortrait: this.mustGetImage("p2-main-portrait"),
       p1PreviewName: this.mustGet("p1-preview-name"),
       p2PreviewName: this.mustGet("p2-preview-name"),
       p1Ready: this.mustGet("p1-ready"),
       p2Ready: this.mustGet("p2-ready"),
       p2Label: this.mustGet("p2-label"),
+      characterBack: this.mustGetButton("character-back"),
       stageScreen: this.mustGet("stage-screen"),
       stageGrid: this.mustGet("stage-grid"),
       stageName: this.mustGet("stage-name"),
+      stageBack: this.mustGetButton("stage-back"),
       restartButton: this.mustGetButton("restart-round"),
       p1Name: this.mustGet("p1-name"),
       p2Name: this.mustGet("p2-name"),
@@ -457,6 +580,12 @@ export class DomUi {
       p2Special: this.mustGet("p2-special"),
       p1SpecialLabel: this.mustGet("p1-special-label"),
       p2SpecialLabel: this.mustGet("p2-special-label"),
+      p1AssistPortrait: this.mustGetImage("p1-assist-portrait"),
+      p2AssistPortrait: this.mustGetImage("p2-assist-portrait"),
+      p1Assist: this.mustGet("p1-assist"),
+      p2Assist: this.mustGet("p2-assist"),
+      p1AssistLabel: this.mustGet("p1-assist-label"),
+      p2AssistLabel: this.mustGet("p2-assist-label"),
       p1Rounds: this.mustGet("p1-rounds"),
       p2Rounds: this.mustGet("p2-rounds"),
       timer: this.mustGet("timer"),
@@ -468,7 +597,76 @@ export class DomUi {
       matchWinnerTitle: this.mustGet("match-winner-title"),
       restartMatch: this.mustGetButton("restart-match"),
       winnerMainMenu: this.mustGetButton("winner-main-menu"),
+      mobileControls: this.mustGet("mobile-controls"),
+      mobilePause: this.mustGetButton("mobile-pause"),
     };
+  }
+
+  private bindTouchControls(callbacks: UiCallbacks) {
+    for (const button of this.elements.mobileControls.querySelectorAll<HTMLButtonElement>("[data-touch-action]")) {
+      const action = button.dataset.touchAction as TouchAction | undefined;
+      if (!action) {
+        continue;
+      }
+      const release = (event: Event) => {
+        event.preventDefault();
+        callbacks.touchAction(action, "up");
+      };
+      button.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        callbacks.unlockAudio();
+        button.setPointerCapture?.((event as PointerEvent).pointerId);
+        callbacks.touchAction(action, "down");
+      });
+      button.addEventListener("pointerup", release);
+      button.addEventListener("pointercancel", release);
+      button.addEventListener("pointerleave", (event) => {
+        if ((event as PointerEvent).buttons !== 0) {
+          release(event);
+        }
+      });
+    }
+  }
+
+  private loadTouchControlSkins() {
+    const atlas = new Image();
+    atlas.decoding = "async";
+    atlas.onload = () => {
+      // The bundled controller pack is a sprite atlas. The action buttons use
+      // its crisp PS-style square, cross, circle, and triangle glyphs.
+      for (const button of this.elements.mobileControls.querySelectorAll<HTMLButtonElement>("[data-touch-skin]")) {
+        if (["punch", "kick", "throw", "ss-partner"].includes(button.dataset.touchSkin ?? "")) {
+          button.classList.add("has-controller-icon");
+        }
+      }
+    };
+    atlas.onerror = () => this.loadDirectTouchSkins();
+    atlas.src = "/assets/ui/mobile-controls/controller_ps.png";
+  }
+
+  private loadDirectTouchSkins() {
+    for (const button of this.elements.mobileControls.querySelectorAll<HTMLButtonElement>("[data-touch-skin]")) {
+      const skin = button.dataset.touchSkin as TouchSkin | undefined;
+      if (!skin || !touchSkinCandidates[skin]) {
+        continue;
+      }
+      this.tryTouchSkin(button, touchSkinCandidates[skin], 0);
+    }
+  }
+
+  private tryTouchSkin(button: HTMLButtonElement, candidates: string[], index: number) {
+    const filename = candidates[index];
+    if (!filename) {
+      return;
+    }
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => {
+      button.style.setProperty("--touch-art", `url("/assets/ui/mobile-controls/${filename}")`);
+      button.classList.add("has-touch-art");
+    };
+    image.onerror = () => this.tryTouchSkin(button, candidates, index + 1);
+    image.src = `/assets/ui/mobile-controls/${filename}`;
   }
 
   private mustGet(id: string): HTMLElement {

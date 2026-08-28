@@ -39,8 +39,15 @@ export class FighterAi {
       Boolean(ai.def.throw) &&
       contactDistance <= this.difficulty.throwRange;
     const targetIsVulnerableToThrow = target.blocking || (!target.activeAttack && Math.abs(target.vx) < 18);
+    const canAssist = ai.assistMeter >= 100 && !ai.activeAttack && ai.hitStunMs <= 0;
 
     if (
+      canAssist &&
+      (target.blocking || target.activeAttack || distance <= this.difficulty.specialRange) &&
+      Math.random() < this.difficulty.assistChance
+    ) {
+      next.assist = true;
+    } else if (
       canThrow &&
       targetIsVulnerableToThrow &&
       Math.random() < this.difficulty.throwChance * (target.blocking ? 1.35 : 1)

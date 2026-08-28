@@ -28,6 +28,7 @@ import {
   type PoseAsset,
   type PoseName,
   type SpecialEffectKind,
+  type StageAssetManifest,
   type VfxConfig,
 } from "../../game/assets/manifest";
 import { audioConfig } from "../../game/config/audio";
@@ -36,6 +37,7 @@ import { arcadeFonts } from "../../game/config/fonts";
 import {
   menuLightningConfig,
   refereeRoundIntroPresentation,
+  assistPresentation,
   spawnEntrancePresentation,
   specialIntroPresentation,
 } from "../../game/config/presentation";
@@ -45,18 +47,33 @@ import {
   SPECIAL_INTRO_PAUSE_MS,
   SPECIAL_NAME_DISPLAY_MS,
   SPECIAL_RECOVERY_MS,
+  SS_PARTNER_DOUBLE_TAP_MS,
   THROW_RECOVERY_MS,
+  ASSIST_ENTRANCE_MS,
+  ASSIST_EXIT_MS,
   type AttackName,
 } from "../../game/config/attacks";
-import { createKeyboardBindings, emptyInput, readInput, type KeyboardBindings } from "../../game/input/bindings";
+import { createKeyboardBindings, emptyInput, readInput, type KeyboardBindings, type PlayerInput } from "../../game/input/bindings";
 import { FighterAi } from "../../game/simulation/ai";
 import { RoundSimulation } from "../../game/simulation/RoundSimulation";
 import type { FighterId, FighterState, GameMode, RoundSnapshot, ThrowSequenceState } from "../../game/simulation/types";
-import { DomUi, type MatchScore, type MusicChoice, type PauseAction, type RoundSelection, type SelectSnapshot } from "../../ui/dom";
+import {
+  DomUi,
+  type MatchScore,
+  type MusicChoice,
+  type PauseAction,
+  type RoundSelection,
+  type SelectSnapshot,
+  type TouchAction,
+  type TouchPhase,
+} from "../../ui/dom";
+import { stageWorldDefaults } from "../../game/config/stage";
 
 type FighterView = {
   sprite: Phaser.GameObjects.Sprite;
   shadow: Phaser.GameObjects.Ellipse;
+  domImage: HTMLImageElement | null;
+  domTextureKey: string | null;
   lastPose: PoseName | null;
   frameAnimation: {
     name: MovementAnimationName | null;
@@ -73,7 +90,7 @@ type FighterView = {
 
 type ScreenState = "title" | "characters" | "stage" | "playing" | "paused" | "match-over";
 type MenuKeys = Record<
-  "enter" | "escape" | "space" | "music" | "p1Up" | "p1Down" | "p2Up" | "p2Down" | "p1Back" | "p2Back",
+  "enter" | "escape" | "space" | "music" | "mobile" | "p1Up" | "p1Down" | "p2Up" | "p2Down" | "p1Back" | "p2Back",
   Phaser.Input.Keyboard.Key
 >;
 
@@ -94,8 +111,8 @@ const maxRoundOverPauseMs = 8000;
 const fallbackRoundOverPauseMs = 1500;
 const noMusicKey = "none";
 const defaultMusicKey = "music-taguro-song";
-const logicalStageWidth = 960;
-const logicalStageHeight = 540;
+const logicalStageWidth = stageWorldDefaults.visibleWidth;
+const logicalStageHeight = stageWorldDefaults.visibleHeight;
 const musicStorageKey = "bsu-online-suntukan.music";
 const retiredMusicKeyMigration: Record<string, string> = {
   "music-ptangona-remix": "music-menu",
@@ -114,6 +131,23 @@ type SpawnEntranceElement = {
   dom: Phaser.GameObjects.DOMElement;
   image: HTMLImageElement;
 };
+
+type AssistView = {
+  sprite: Phaser.GameObjects.Sprite;
+  shadow: Phaser.GameObjects.Ellipse;
+  domImage: HTMLImageElement | null;
+  domTextureKey: string | null;
+  def: FighterAssetManifest;
+  callerId: FighterId;
+  facing: -1 | 1;
+  x: number;
+  y: number;
+};
+
+type SpecialTapState = {
+  timer: Phaser.Time.TimerEvent | null;
+  fireSingle: boolean;
+};
 const fighterBattleVisualScale = 1;
 const musicChoices: MusicChoice[] = [
   { key: noMusicKey, displayName: "No Music" },
@@ -127,9 +161,11 @@ export class BattleScene extends Phaser.Scene {
   private sim: RoundSimulation | null = null;
   private ai = new FighterAi(aiDifficulty);
   private fighterViews = new Map<FighterId, FighterView>();
-  private background!: Phaser.GameObjects.Image;
+  private background!: Phaser.GameObjects.Image | Phaser.GameObjects.TileSprite;
   private screen: ScreenState = "title";
   private hasStarted = false;
+  private mobileMode = false;
+  private touchInput: PlayerInput = emptyInput();
   private stageIndex = 0;
   private pauseIndex = 0;
   private settingsOpen = false;
@@ -137,15 +173,22 @@ export class BattleScene extends Phaser.Scene {
   private roundEndHandled = false;
   private selectState: SelectSnapshot = {
     mode: "pvp",
+    step: "main",
     p1Index: 0,
     p2Index: 1,
     p1Locked: false,
     p2Locked: false,
+    p1AssistIndex: 2,
+    p2AssistIndex: 3,
+    p1AssistLocked: false,
+    p2AssistLocked: false,
   };
   private lastSelection: RoundSelection = {
     mode: "pvp",
     p1FighterKey: fighterManifests[0].key,
     p2FighterKey: fighterManifests[1]?.key ?? fighterManifests[0].key,
+    p1AssistKey: fighterManifests[2]?.key ?? fighterManifests[0].key,
+    p2AssistKey: fighterManifests[3]?.key ?? fighterManifests[1]?.key ?? fighterManifests[0].key,
     stageKey: stageManifests[0].key,
   };
   private score: MatchScore = { p1: 0, p2: 0 };
@@ -156,9 +199,20 @@ export class BattleScene extends Phaser.Scene {
   private playingVoiceKeys = new Set<string>();
   private specialActivationSounds: Phaser.Sound.BaseSound[] = [];
   private currentGroundY = 474;
+  private currentStageWidth: number = stageWorldDefaults.stageWidth;
+  private currentStageHeight: number = stageWorldDefaults.stageHeight;
+  private currentStageLeft: number = stageWorldDefaults.edgePadding;
+  private currentStageRight: number = stageWorldDefaults.stageWidth - stageWorldDefaults.edgePadding;
+  private currentCameraMinX: number = logicalStageWidth / 2;
+  private currentCameraMaxX: number = stageWorldDefaults.stageWidth - logicalStageWidth / 2;
+  private currentStageScrolling = true;
+  private cameraRefitFrame: number | null = null;
+  private readonly onScaleResize = () => this.fitBattleCamera();
+  private readonly onUserInteraction = () => this.unlockAudio();
   private menuMusic: Phaser.Sound.BaseSound | null = null;
   private menuMusicKey: string | null = null;
   private selectedMusicKey = defaultMusicKey;
+  private musicLoadPromises = new Map<string, Promise<boolean>>();
   private menuLightningTimers: Phaser.Time.TimerEvent[] = [];
   private menuLightningElements: HTMLElement[] = [];
   private specialEffectObjects: Phaser.GameObjects.GameObject[] = [];
@@ -175,12 +229,19 @@ export class BattleScene extends Phaser.Scene {
   private selectionConfirmTimers: Phaser.Time.TimerEvent[] = [];
   private roundOverPlayed = false;
   private lastRoundOverPauseMs = fallbackRoundOverPauseMs;
+  private roundStartSoundHandled = false;
   private roundIntroActive = false;
   private refereeIntroRunId = 0;
   private refereeIntroElements: RefereeIntroElements | null = null;
   private refereeIntroTimers: Phaser.Time.TimerEvent[] = [];
   private refereeIntroTweens: Phaser.Tweens.Tween[] = [];
   private refereeAuraSound: Phaser.Sound.BaseSound | null = null;
+  private stageVideo: HTMLVideoElement | null = null;
+  private stageVideoStageKey: string | null = null;
+  private stageVideoReady = false;
+  private preparedStageVideoPath: string | null = null;
+  private preparedStageVideoAvailable = false;
+  private stageVideoUnlockHandler: (() => void) | null = null;
   private spawnEntranceActive = false;
   private spawnEntranceRunId = 0;
   private spawnEntranceRevealed = new Set<FighterId>();
@@ -189,9 +250,20 @@ export class BattleScene extends Phaser.Scene {
   private spawnEntranceTimers: Phaser.Time.TimerEvent[] = [];
   private spawnEntranceTweens: Phaser.Tweens.Tween[] = [];
   private queuedTextureKeys = new Set<string>();
+  private textureAssetPaths = new Map<string, string>();
   private queuedAudioKeys = new Set<string>();
   private matchAssetLoadInProgress = false;
   private matchAssetLoadRunId = 0;
+  private assistView: AssistView | null = null;
+  private assistRunId = 0;
+  private assistTimers: Phaser.Time.TimerEvent[] = [];
+  private assistTweens: Phaser.Tweens.Tween[] = [];
+  private assistEntranceDom: Phaser.GameObjects.DOMElement | null = null;
+  private assistImpactSfxPlayed = false;
+  private specialTapStates: Record<"p1" | "p2", SpecialTapState> = {
+    p1: { timer: null, fireSingle: false },
+    p2: { timer: null, fireSingle: false },
+  };
 
   constructor() {
     super("BattleScene");
@@ -201,15 +273,29 @@ export class BattleScene extends Phaser.Scene {
     this.bindLoadingProgress();
     this.selectedMusicKey = this.loadSavedMusicKey();
     const defaultStage = getStageManifest(stageManifests[0]?.key ?? "");
+    const initialMusic = this.selectedMusicTrack();
     this.queueImageFile(defaultStage.key, defaultStage.path);
     this.queueAudioFile(sfxManifest.menuSelect.key, sfxManifest.menuSelect.path);
+    // Load the chosen opening track with Phaser's initial loader. This avoids
+    // competing loaders if the player clicks a menu button immediately.
+    if (initialMusic) {
+      this.queueAudioFile(initialMusic.key, initialMusic.path);
+    }
   }
 
   create() {
+    this.configureDomOverlayLayer();
+    this.scale.on(Phaser.Scale.Events.RESIZE, this.onScaleResize);
     this.fitBattleCamera();
-    this.scale.on(Phaser.Scale.Events.RESIZE, this.fitBattleCamera, this);
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
-      this.scale.off(Phaser.Scale.Events.RESIZE, this.fitBattleCamera, this);
+      this.scale.off(Phaser.Scale.Events.RESIZE, this.onScaleResize);
+      window.removeEventListener("pointerdown", this.onUserInteraction, true);
+      window.removeEventListener("keydown", this.onUserInteraction, true);
+      if (this.cameraRefitFrame !== null) {
+        cancelAnimationFrame(this.cameraRefitFrame);
+        this.cameraRefitFrame = null;
+      }
+      this.cleanupStageVideo();
     });
     this.ensureFallbackTextures();
     this.configureFighterTextureFiltering();
@@ -217,12 +303,21 @@ export class BattleScene extends Phaser.Scene {
     this.createVfxAnimations();
     this.createBackground();
     this.createFloorMarks();
+    window.addEventListener("pointerdown", this.onUserInteraction, true);
+    window.addEventListener("keydown", this.onUserInteraction, true);
     this.keys = createKeyboardBindings(this);
     this.menuKeys = this.createMenuKeys();
     this.selectedMusicKey = this.loadSavedMusicKey();
     this.ui = new DomUi(
       {
-        chooseMode: (mode) => this.enterCharacterSelect(mode),
+        chooseMode: (mode) => {
+          this.setMobileMode(false);
+          this.enterCharacterSelect(mode);
+        },
+        chooseMobileMode: () => {
+          this.setMobileMode(true);
+          this.enterCharacterSelect("pvc");
+        },
         previewSelection: () => undefined,
         startMatch: (selection) => this.startMatch(selection, true),
         changeMusic: (delta) => this.changeMusicSelection(delta),
@@ -231,6 +326,12 @@ export class BattleScene extends Phaser.Scene {
         pauseAction: (action) => this.applyPauseAction(action),
         restartMatch: () => this.startMatch(this.lastSelection, true),
         mainMenu: () => this.enterMainMenu(),
+        selectFighter: (index) => this.handleMobileFighterSelect(index),
+        backFromCharacters: () => this.handleCharacterSelectBack(),
+        backFromStage: () => this.enterCharacterSelect(this.lastSelection.mode),
+        touchAction: (action, phase) => this.handleTouchAction(action, phase),
+        mobilePause: () => this.pauseGame(),
+        unlockAudio: () => this.unlockAudio(),
       },
       fighterManifests,
       stageManifests,
@@ -239,6 +340,18 @@ export class BattleScene extends Phaser.Scene {
     this.ui.updateMusicChoice(this.selectedMusicKey);
     this.enterMainMenu();
     this.hideLoadingScreen();
+  }
+
+  // Phaser keeps GIF-backed effects in a sibling DOM container. Keep that
+  // container above the WebGL canvas while stage video stays underneath both.
+  private configureDomOverlayLayer() {
+    const domContainer = this.game.domContainer;
+    if (!domContainer) {
+      return;
+    }
+    domContainer.classList.add("phaser-dom-overlay");
+    domContainer.style.zIndex = "2";
+    domContainer.style.pointerEvents = "none";
   }
 
   update(_time: number, deltaMs: number) {
@@ -251,24 +364,26 @@ export class BattleScene extends Phaser.Scene {
     }
 
     if (this.roundIntroActive) {
+      this.updateBattleCamera(this.sim.snapshot, false, clampedDelta);
       this.syncViews(this.sim.snapshot);
+      this.syncAssistDomVisual();
       this.ui.updateHud(this.sim.snapshot, this.score);
       return;
     }
 
+    const p1Input = this.mobileMode ? this.readTouchInput() : readInput(this.keys.p1);
+    const p1CanAct =
+      this.sim.snapshot.specialSequence.phase === "idle" && this.sim.snapshot.assistSequence.phase === "idle";
     const inputs =
       this.sim.snapshot.status === "playing"
         ? {
-            p1:
-              this.sim.snapshot.specialSequence.phase === "idle"
-                ? readInput(this.keys.p1)
-                : emptyInput(),
+            p1: p1CanAct ? this.resolveSpecialTap("p1", p1Input) : emptyInput(),
             p2:
-              this.sim.snapshot.specialSequence.phase === "idle"
-                ? this.sim.snapshot.mode === "pvc"
-                  ? this.readAiInput(clampedDelta)
-                  : readInput(this.keys.p2)
-                : emptyInput(),
+              p1CanAct && this.sim.snapshot.mode === "pvc"
+                ? this.readAiInput(clampedDelta)
+                : p1CanAct
+                  ? this.resolveSpecialTap("p2", readInput(this.keys.p2))
+                  : emptyInput(),
           }
         : {
             p1: emptyInput(),
@@ -276,18 +391,24 @@ export class BattleScene extends Phaser.Scene {
           };
 
     this.sim.update(clampedDelta, inputs);
+    this.updateBattleCamera(this.sim.snapshot, false, clampedDelta);
     this.syncViews(this.sim.snapshot);
+    this.syncAssistDomVisual();
     this.ui.updateHud(this.sim.snapshot, this.score);
   }
 
   private enterMainMenu() {
+    this.setMobileMode(false);
+    this.clearTouchInput();
     this.stopRoundAdvance();
+    this.clearSpecialTapStates();
     this.cancelSelectionConfirm();
     this.cleanupRefereeRoundIntro();
     this.cleanupMenuLightning();
     this.stopTransientSfx();
     this.sim?.cancelSpecialSequence();
     this.cleanupSpecialEffects();
+    this.cleanupAssist();
     this.resetMatch();
     this.settingsOpen = false;
     this.screen = "title";
@@ -301,13 +422,16 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private enterCharacterSelect(mode: GameMode) {
+    this.clearTouchInput();
     this.stopRoundAdvance();
+    this.clearSpecialTapStates();
     this.cancelSelectionConfirm();
     this.cleanupRefereeRoundIntro();
     this.cleanupMenuLightning();
     this.stopTransientSfx();
     this.sim?.cancelSpecialSequence();
     this.cleanupSpecialEffects();
+    this.cleanupAssist();
     this.resetMatch();
     this.settingsOpen = false;
     this.screen = "characters";
@@ -316,28 +440,38 @@ export class BattleScene extends Phaser.Scene {
     this.playMenuMusic();
     this.selectState = {
       mode,
+      step: "main",
       p1Index: this.findFighterIndex(this.lastSelection.p1FighterKey, 0),
       p2Index: this.findFighterIndex(this.lastSelection.p2FighterKey, 1),
       p1Locked: false,
       p2Locked: false,
+      p1AssistIndex: this.findFighterIndex(this.lastSelection.p1AssistKey, 2),
+      p2AssistIndex: this.findFighterIndex(this.lastSelection.p2AssistKey, 3),
+      p1AssistLocked: false,
+      p2AssistLocked: false,
     };
     this.ui.showCharacterSelect(this.selectState);
+    this.ui.setMobileControls(false);
     this.startMenuLightning();
   }
 
   private enterStageSelect() {
+    this.clearTouchInput();
     this.cancelSelectionConfirm();
+    this.clearSpecialTapStates();
     this.cleanupRefereeRoundIntro();
     this.cleanupMenuLightning();
     this.settingsOpen = false;
     this.sim?.cancelSpecialSequence();
     this.cleanupSpecialEffects();
+    this.cleanupAssist();
     this.screen = "stage";
     this.playMenuMusic();
     this.lastSelection = this.selectionFromSelectState();
     this.stageIndex = this.findStageIndex(this.lastSelection.stageKey);
     this.setStage(this.lastSelection.stageKey);
     this.ui.showStageSelect(this.lastSelection);
+    this.ui.setMobileControls(false);
     this.startMenuLightning();
   }
 
@@ -371,14 +505,21 @@ export class BattleScene extends Phaser.Scene {
 
   private startRound() {
     this.stopRoundAdvance();
+    this.clearTouchInput();
+    this.clearSpecialTapStates();
     this.cleanupRefereeRoundIntro();
     this.sim?.cancelSpecialSequence();
+    // Do not let setStage() frame the previous round while the new fighters
+    // are being created. The next round must begin from the stage center.
+    this.sim = null;
     this.cleanupSpecialEffects();
+    this.cleanupAssist();
     this.cleanupMenuLightning();
     this.screen = "playing";
     this.settingsOpen = false;
     this.roundEndHandled = false;
     this.roundOverPlayed = false;
+    this.roundStartSoundHandled = false;
     this.stopTransientSfx();
     this.resetVoicePolicy();
     this.stopMenuMusic();
@@ -386,12 +527,16 @@ export class BattleScene extends Phaser.Scene {
     this.ui.hideRoundMessage();
     this.ui.hidePauseMenu();
     this.ui.showGameplay();
+    this.ui.setMobileControls(this.mobileMode);
     this.ai.reset();
     this.destroyFighterViews();
 
     const p1Def = getFighterManifest(this.lastSelection.p1FighterKey);
     const p2Def = getFighterManifest(this.lastSelection.p2FighterKey);
+    const p1AssistDef = getFighterManifest(this.lastSelection.p1AssistKey);
+    const p2AssistDef = getFighterManifest(this.lastSelection.p2AssistKey);
     this.setStage(this.lastSelection.stageKey);
+    this.ui.setAssistSelection(p1AssistDef, p2AssistDef);
 
     this.sim = new RoundSimulation(this.lastSelection.mode, p1Def, p2Def, {
       onAttack: (fighter, attackName) => {
@@ -439,6 +584,40 @@ export class BattleScene extends Phaser.Scene {
           view.sprite.clearTint();
         }
       },
+      onAssistStart: (caller, victim, assist) => {
+        this.playAssistStart(caller, victim, assist);
+      },
+      onAssistHit: (caller, victim, assist) => {
+        const assistView = this.assistView;
+        if (
+          !assistView?.sprite.active ||
+          this.screen !== "playing" ||
+          this.roundEndHandled
+        ) {
+          return;
+        }
+        const assistState = {
+          ...caller,
+          def: assist,
+          x: assistView.x,
+          y: assistView.y,
+          facing: assistView.facing,
+        };
+        // The simulation event and the visible impact frame use the same
+        // configured timestamp. Play the cue here, once, so it cannot be
+        // queued behind the Partner exit animation.
+        if (!this.assistImpactSfxPlayed) {
+          // Keep Partner impact feedback identical to the main special path.
+          this.playSpecialImpactSfx(assistState);
+          this.assistImpactSfxPlayed = true;
+        }
+        this.playSpecialImpactVfx(assistState, victim);
+        this.playSpecialImpact(assistState, victim);
+        this.playHurtVoice(victim);
+      },
+      onAssistEnd: () => {
+        this.cleanupAssist();
+      },
       onKo: (winner) => {
         if (winner !== "draw") {
           const loser = winner === "p1" ? this.sim?.snapshot.fighters.p2 : this.sim?.snapshot.fighters.p1;
@@ -463,11 +642,23 @@ export class BattleScene extends Phaser.Scene {
       },
     }, {
       groundY: this.currentGroundY,
+      stageWidth: this.currentStageWidth,
+      stageLeft: this.currentStageLeft,
+      stageRight: this.currentStageRight,
+      maxFighterSeparation: stageWorldDefaults.maxFighterSeparation,
+      assistSpecials: { p1: p1AssistDef, p2: p2AssistDef },
     });
 
     this.createFighterView("p1", p1Def);
     this.createFighterView("p2", p2Def);
     this.syncViews(this.sim.snapshot);
+    // A new round always starts from fresh, centered fighter positions. Snap
+    // the camera to that snapshot before the entrance/referee sequence so a
+    // previous round's scroll position cannot leave the fighters off-screen.
+    this.updateBattleCamera(this.sim.snapshot, true, 16);
+    // Browser zoom and the DOM loading overlay can settle one or two frames
+    // after a match starts. Refit once the canvas has its final dimensions.
+    this.scheduleCameraRefit();
     this.ui.updateHud(this.sim.snapshot, this.score);
     this.playRoundStartSequence(this.currentRoundNumber());
   }
@@ -478,6 +669,7 @@ export class BattleScene extends Phaser.Scene {
     }
 
     this.roundEndHandled = true;
+    this.clearSpecialTapStates();
     this.cleanupRefereeRoundIntro();
     this.sim.cancelSpecialSequence();
     this.cleanupSpecialEffects();
@@ -504,13 +696,17 @@ export class BattleScene extends Phaser.Scene {
       return;
     }
     this.screen = "match-over";
+    this.clearTouchInput();
+    this.clearSpecialTapStates();
     this.cleanupRefereeRoundIntro();
     this.sim.cancelSpecialSequence();
     this.cleanupSpecialEffects();
+    this.cleanupAssist();
     this.cleanupMenuLightning();
     this.sound.stopAll();
     this.clearSfxGuards();
     this.ui.hideRoundMessage();
+    this.ui.setMobileControls(false);
     this.ui.showMatchWinner(this.sim.snapshot.fighters[winner].def.displayName, this.score);
   }
 
@@ -519,14 +715,18 @@ export class BattleScene extends Phaser.Scene {
       return;
     }
     this.screen = "paused";
+    this.clearTouchInput();
+    this.clearSpecialTapStates();
     this.pauseIndex = 0;
     this.cleanupRefereeRoundIntro();
     this.sim.cancelSpecialSequence();
     this.cleanupSpecialEffects();
+    this.cleanupAssist();
     this.cleanupMenuLightning();
     this.sound.pauseAll();
     this.tweens.pauseAll();
     this.time.paused = true;
+    this.ui.setMobileControls(this.mobileMode, true);
     this.ui.showPauseMenu(this.pauseIndex);
   }
 
@@ -538,6 +738,7 @@ export class BattleScene extends Phaser.Scene {
     this.time.paused = false;
     this.tweens.resumeAll();
     this.sound.resumeAll();
+    this.ui.setMobileControls(this.mobileMode, false);
     this.ui.hidePauseMenu();
   }
 
@@ -549,8 +750,10 @@ export class BattleScene extends Phaser.Scene {
 
     this.sound.stopAll();
     this.clearSfxGuards();
+    this.clearTouchInput();
     this.cleanupRefereeRoundIntro();
     this.cleanupSpecialEffects();
+    this.cleanupAssist();
     this.time.paused = false;
     this.tweens.resumeAll();
     this.ui.hidePauseMenu();
@@ -581,9 +784,15 @@ export class BattleScene extends Phaser.Scene {
       }
       if (this.just(this.keys.p1.punch)) {
         this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+        this.setMobileMode(false);
         this.enterCharacterSelect("pvp");
       } else if (this.just(this.keys.p2.punch)) {
         this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+        this.setMobileMode(false);
+        this.enterCharacterSelect("pvc");
+      } else if (this.just(this.menuKeys.mobile)) {
+        this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+        this.setMobileMode(true);
         this.enterCharacterSelect("pvc");
       }
       return;
@@ -622,33 +831,179 @@ export class BattleScene extends Phaser.Scene {
     }
   }
 
+  private setMobileMode(enabled: boolean) {
+    this.mobileMode = enabled;
+    document.body.dataset.mobileMode = enabled ? "true" : "false";
+    this.ui?.setMobileMode(enabled);
+    if (!enabled) {
+      this.ui?.setMobileControls(false);
+    }
+  }
+
+  private handleTouchAction(action: TouchAction, phase: TouchPhase) {
+    this.unlockAudio();
+    if (!this.mobileMode) {
+      return;
+    }
+
+    if (phase === "down") {
+      if (this.screen !== "playing" || this.roundIntroActive || this.sim?.snapshot.status !== "playing") {
+        return;
+      }
+      this.touchInput[action] = true;
+      return;
+    }
+
+    if (action === "left" || action === "right" || action === "block") {
+      this.touchInput[action] = false;
+    }
+  }
+
+  private readTouchInput(): PlayerInput {
+    const input = { ...this.touchInput };
+    this.touchInput.jump = false;
+    this.touchInput.punch = false;
+    this.touchInput.kick = false;
+    this.touchInput.throw = false;
+    this.touchInput.special = false;
+    this.touchInput.assist = false;
+    return input;
+  }
+
+  private clearTouchInput() {
+    this.touchInput = emptyInput();
+  }
+
+  private handleCharacterSelectBack() {
+    if (this.screen !== "characters" || this.selectionConfirming) {
+      return;
+    }
+    if (this.selectState.step === "assist") {
+      this.selectState.step = "main";
+      this.selectState.p1AssistLocked = false;
+      this.selectState.p2AssistLocked = false;
+      this.ui.updateCharacterSelect(this.selectState);
+      return;
+    }
+    this.enterMainMenu();
+  }
+
+  private handleMobileFighterSelect(index: number) {
+    if (!this.mobileMode || this.screen !== "characters" || this.selectionConfirming) {
+      return;
+    }
+
+    const assistStep = this.selectState.step === "assist";
+    if (assistStep) {
+      if (!this.isSelectableAssistIndex(index, this.selectState.p1Index)) {
+        this.playSfx(sfxManifest.block.key, "block", { cooldownMs: 180 });
+        return;
+      }
+      this.selectState.p1AssistIndex = index;
+      this.selectState.p1AssistLocked = true;
+      this.selectState.p2AssistIndex = this.randomCpuAssistIndex(this.selectState.p2Index);
+      this.selectState.p2AssistLocked = true;
+      this.ui.updateCharacterSelect(this.selectState);
+      this.confirmCharacterSelection();
+      return;
+    }
+
+    if (!this.isPlayableFighterIndex(index)) {
+      this.playSfx(sfxManifest.block.key, "block", { cooldownMs: 180 });
+      return;
+    }
+
+    this.selectState.p1Index = index;
+    this.selectState.p1Locked = true;
+    this.selectState.p2Index = this.randomCpuFighterIndex(index);
+    this.selectState.p2Locked = true;
+    this.selectState.p1AssistIndex = this.firstSelectableAssistIndex(index);
+    this.selectState.p2AssistIndex = this.randomCpuAssistIndex(this.selectState.p2Index);
+    this.selectState.step = "assist";
+    this.selectState.p1AssistLocked = false;
+    this.selectState.p2AssistLocked = false;
+    this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+    this.ui.updateCharacterSelect(this.selectState);
+  }
+
   private handleCharacterSelectInput() {
     if (this.selectionConfirming) {
       return;
     }
 
+    if (this.just(this.menuKeys.escape)) {
+      if (this.selectState.step === "assist") {
+        this.selectState.step = "main";
+        this.selectState.p1AssistLocked = false;
+        this.selectState.p2AssistLocked = false;
+        this.ui.updateCharacterSelect(this.selectState);
+      } else {
+        this.enterMainMenu();
+      }
+      return;
+    }
+
+    const assistStep = this.selectState.step === "assist";
+    const p1Locked = assistStep ? this.selectState.p1AssistLocked : this.selectState.p1Locked;
+    const p2Locked = assistStep ? this.selectState.p2AssistLocked : this.selectState.p2Locked;
     let changed = false;
-    if (!this.selectState.p1Locked) {
+
+    if (!p1Locked) {
       const delta = this.cursorDelta("p1");
       if (delta !== 0) {
-        this.selectState.p1Index = this.wrapFighterIndex(this.selectState.p1Index + delta);
+        if (assistStep) {
+          this.selectState.p1AssistIndex = this.wrapFighterIndex(this.selectState.p1AssistIndex + delta);
+        } else {
+          this.selectState.p1Index = this.wrapFighterIndex(this.selectState.p1Index + delta);
+        }
         changed = true;
       }
     }
 
-    if (!this.selectState.p2Locked) {
+    if (!p2Locked) {
       const delta = this.cursorDelta("p2");
       if (delta !== 0) {
-        this.selectState.p2Index = this.wrapFighterIndex(this.selectState.p2Index + delta);
+        if (assistStep) {
+          this.selectState.p2AssistIndex = this.wrapFighterIndex(this.selectState.p2AssistIndex + delta);
+        } else {
+          this.selectState.p2Index = this.wrapFighterIndex(this.selectState.p2Index + delta);
+        }
         changed = true;
       }
     }
 
-    if (this.just(this.keys.p1.punch) && !this.selectState.p1Locked) {
-      if (this.isPlayableFighterIndex(this.selectState.p1Index)) {
-        this.selectState.p1Locked = true;
-        if (this.selectState.mode === "pvc") {
-          this.selectState.p2Index = this.randomCpuFighterIndex(this.selectState.p1Index);
+    const p1Confirm = this.just(this.keys.p1.punch);
+    const p2Confirm = this.just(this.keys.p2.punch);
+    if (p1Confirm && !p1Locked) {
+      const index = assistStep ? this.selectState.p1AssistIndex : this.selectState.p1Index;
+      const mainIndex = this.selectState.p1Index;
+      if (assistStep ? this.isSelectableAssistIndex(index, mainIndex) : this.isPlayableFighterIndex(index)) {
+        if (assistStep) {
+          this.selectState.p1AssistLocked = true;
+          if (this.selectState.mode === "pvc") {
+            this.selectState.p2AssistIndex = this.randomCpuAssistIndex(this.selectState.p2Index);
+            this.selectState.p2AssistLocked = true;
+          }
+        } else {
+          this.selectState.p1Locked = true;
+          if (this.selectState.mode === "pvc") {
+            this.selectState.p2Index = this.randomCpuFighterIndex(this.selectState.p1Index);
+            this.selectState.p2Locked = true;
+          }
+        }
+        this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+        changed = true;
+      } else {
+        this.playSfx(sfxManifest.block.key, "block", { cooldownMs: 180 });
+      }
+    }
+    if (p2Confirm && this.selectState.mode === "pvp" && !p2Locked) {
+      const index = assistStep ? this.selectState.p2AssistIndex : this.selectState.p2Index;
+      const mainIndex = this.selectState.p2Index;
+      if (assistStep ? this.isSelectableAssistIndex(index, mainIndex) : this.isPlayableFighterIndex(index)) {
+        if (assistStep) {
+          this.selectState.p2AssistLocked = true;
+        } else {
           this.selectState.p2Locked = true;
         }
         this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
@@ -657,45 +1012,55 @@ export class BattleScene extends Phaser.Scene {
         this.playSfx(sfxManifest.block.key, "block", { cooldownMs: 180 });
       }
     }
-    if (this.just(this.keys.p2.punch) && this.selectState.mode === "pvp" && !this.selectState.p2Locked) {
-      if (this.isPlayableFighterIndex(this.selectState.p2Index)) {
-        this.selectState.p2Locked = true;
-        this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
-        changed = true;
-      } else {
-        this.playSfx(sfxManifest.block.key, "block", { cooldownMs: 180 });
-      }
-    }
+
     if (this.just(this.keys.p1.kick)) {
-      this.selectState.p1Locked = false;
+      if (assistStep) this.selectState.p1AssistLocked = false;
+      else this.selectState.p1Locked = false;
       changed = true;
     }
     if (this.just(this.keys.p2.kick)) {
-      this.selectState.p2Locked = false;
+      if (assistStep) this.selectState.p2AssistLocked = false;
+      else this.selectState.p2Locked = false;
       changed = true;
     }
 
-    if (
-      this.just(this.menuKeys.enter) ||
-      (this.selectState.p1Locked && this.selectState.p2Locked && (this.just(this.keys.p1.punch) || this.just(this.keys.p2.punch)))
-    ) {
-      if (this.selectState.mode === "pvc" && this.selectState.p1Locked && !this.selectState.p2Locked) {
-        this.selectState.p2Locked = true;
+    const enterPressed = this.just(this.menuKeys.enter);
+    const bothLocked = assistStep
+      ? this.selectState.p1AssistLocked && this.selectState.p2AssistLocked
+      : this.selectState.p1Locked && this.selectState.p2Locked;
+    if (enterPressed || (bothLocked && (p1Confirm || p2Confirm))) {
+      if (this.selectState.mode === "pvc") {
+        if (!assistStep && this.selectState.p1Locked) {
+          this.selectState.p2Locked = true;
+        }
+        if (assistStep && this.selectState.p1AssistLocked && !this.selectState.p2AssistLocked) {
+          this.selectState.p2AssistIndex = this.randomCpuAssistIndex(this.selectState.p2Index);
+          this.selectState.p2AssistLocked = true;
+        }
       }
-      if (this.selectState.p1Locked && this.selectState.p2Locked) {
-        this.confirmCharacterSelection();
-        return;
-      }
-    }
 
-    if (this.just(this.menuKeys.escape)) {
-      this.enterMainMenu();
-      return;
+      if (assistStep) {
+        if (this.selectState.p1AssistLocked && this.selectState.p2AssistLocked) {
+          this.confirmCharacterSelection();
+          return;
+        }
+      } else if (this.selectState.p1Locked && this.selectState.p2Locked) {
+        this.selectState.step = "assist";
+        this.selectState.p1AssistLocked = false;
+        this.selectState.p2AssistLocked = false;
+        this.playSfx(sfxManifest.menuSelect.key, "menuSelect");
+        changed = true;
+      }
     }
 
     if (changed) {
       this.ui.updateCharacterSelect(this.selectState);
     }
+  }
+
+  private isSelectableAssistIndex(index: number, mainIndex: number) {
+    return this.isPlayableFighterIndex(index) &&
+      (assistPresentation.allowSameCharacterAsAssist || index !== mainIndex);
   }
 
   private handleStageSelectInput() {
@@ -745,6 +1110,66 @@ export class BattleScene extends Phaser.Scene {
     }
   }
 
+  private clearSpecialTapStates() {
+    for (const state of Object.values(this.specialTapStates)) {
+      state.timer?.remove(false);
+      state.timer = null;
+      state.fireSingle = false;
+    }
+  }
+
+  private resolveSpecialTap(player: "p1" | "p2", input: PlayerInput): PlayerInput {
+    const state = this.specialTapStates[player];
+
+    if (state.fireSingle) {
+      state.fireSingle = false;
+      // This is the queued result of the first tap. Return it directly so it
+      // reaches RoundSimulation instead of being mistaken for another tap and
+      // starting the double-tap timer again.
+      input.special = true;
+      return input;
+    }
+
+    if (!input.special) {
+      return input;
+    }
+
+    const fighter = this.sim?.snapshot.fighters[player];
+    const specialReady = Boolean(fighter && fighter.specialMeter >= 100);
+    const partnerReady = Boolean(fighter && fighter.assistMeter >= 100);
+
+    // When Partner is not ready, there is no ambiguity to resolve: a single
+    // tap should fire Special immediately. This keeps the mobile button
+    // responsive while preserving the double-tap path when both are ready.
+    if (!partnerReady && specialReady && !state.timer) {
+      return input;
+    }
+
+    if (state.timer) {
+      state.timer.remove(false);
+      state.timer = null;
+      // A double tap is reserved for Partner. If Partner is not ready, consume
+      // the second tap without accidentally firing Special a second time.
+      input.special = false;
+      input.assist = partnerReady;
+      return input;
+    }
+
+    input.special = false;
+    state.timer = this.time.delayedCall(SS_PARTNER_DOUBLE_TAP_MS, () => {
+      state.timer = null;
+      if (
+        specialReady &&
+        this.screen === "playing" &&
+        this.sim?.snapshot.status === "playing" &&
+        !this.roundIntroActive
+      ) {
+        state.fireSingle = true;
+      }
+    });
+    return input;
+  }
+
   private readAiInput(deltaMs: number) {
     if (!this.sim) {
       return emptyInput();
@@ -767,6 +1192,8 @@ export class BattleScene extends Phaser.Scene {
       mode: this.selectState.mode,
       p1FighterKey: fighterManifests[this.selectState.p1Index]?.key ?? fighterManifests[0].key,
       p2FighterKey: fighterManifests[this.selectState.p2Index]?.key ?? fighterManifests[0].key,
+      p1AssistKey: fighterManifests[this.selectState.p1AssistIndex]?.key ?? fighterManifests[2]?.key ?? fighterManifests[0].key,
+      p2AssistKey: fighterManifests[this.selectState.p2AssistIndex]?.key ?? fighterManifests[3]?.key ?? fighterManifests[0].key,
       stageKey: this.lastSelection.stageKey,
     });
   }
@@ -793,6 +1220,12 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private playRoundStartSequence(roundNumber: number) {
+    if (this.sim) {
+      // Re-assert the fresh round framing immediately before any entrance or
+      // referee DOM element is positioned. This also covers a resize event
+      // that happened while the selected match assets were loading.
+      this.updateBattleCamera(this.sim.snapshot, true, 16);
+    }
     if (
       spawnEntrancePresentation.enableSpawnEntrances &&
       (spawnEntrancePresentation.playSpawnEntranceEveryRound || roundNumber === 1)
@@ -1070,11 +1503,19 @@ export class BattleScene extends Phaser.Scene {
     signNode.style.display = "none";
     refereeNode.append(signNode);
 
+    // DOM elements with scrollFactor(0) use camera display coordinates rather
+    // than the fixed 960px design width. At a shorter browser viewport, 480 is
+    // no longer the visible center, which is why the referee drifted left.
+    const stageX = this.cameras.main.displayWidth / 2;
     const aura = this.add
-      .dom(config.stageX, config.startY + config.auraOffsetY, auraNode)
+      .dom(stageX, config.startY + config.auraOffsetY, auraNode)
       .setOrigin(0.5)
-      .setAlpha(config.auraAlpha);
-    const referee = this.add.dom(config.stageX, config.startY, refereeNode).setOrigin(0.5);
+      .setAlpha(config.auraAlpha)
+      .setScrollFactor(0);
+    const referee = this.add
+      .dom(stageX, config.startY, refereeNode)
+      .setOrigin(0.5)
+      .setScrollFactor(0);
 
     this.refereeIntroElements = { aura, referee, frame: frameNode, roundSign: signNode };
     this.startRefereeAuraSound();
@@ -1157,12 +1598,15 @@ export class BattleScene extends Phaser.Scene {
 
     this.cleanupRefereeRoundIntro();
     this.ui.showRoundMessage("FIGHT");
-    this.playSfx(sfxManifest.roundStart.key, "roundStart", {
-      oneShot: true,
-      cooldownMs: 1200,
-      volumeMultiplier: audioConfig.fightVolumeMultiplier,
-      allowBoost: true,
-    });
+    if (!this.roundStartSoundHandled) {
+      this.playSfx(sfxManifest.roundStart.key, "roundStart", {
+        oneShot: true,
+        cooldownMs: 1200,
+        volumeMultiplier: audioConfig.fightVolumeMultiplier,
+        allowBoost: true,
+      });
+    }
+    this.roundStartSoundHandled = false;
     const fightTimer = this.time.delayedCall(refereeRoundIntroPresentation.fightMessageMs, () => {
       if (this.screen === "playing" && !this.roundEndHandled && !this.roundIntroActive) {
         this.ui.hideRoundMessage();
@@ -1302,6 +1746,7 @@ export class BattleScene extends Phaser.Scene {
       escape: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.ESC),
       space: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE),
       music: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.M),
+      mobile: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.V),
       p1Up: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.W),
       p1Down: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.S),
       p2Up: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.UP),
@@ -1352,6 +1797,9 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private queueImageFile(key: string, path: string) {
+    if (key && path) {
+      this.textureAssetPaths.set(key, path);
+    }
     if (!key || !path || this.textures.exists(key) || this.queuedTextureKeys.has(key)) {
       return false;
     }
@@ -1361,6 +1809,9 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private queuePoseFile(pose: PoseAsset) {
+    if (pose.key && pose.path) {
+      this.textureAssetPaths.set(pose.key, pose.path);
+    }
     if (pose.type === "spritesheet") {
       if (!pose.key || !pose.path || this.textures.exists(pose.key) || this.queuedTextureKeys.has(pose.key)) {
         return false;
@@ -1435,9 +1886,14 @@ export class BattleScene extends Phaser.Scene {
     const fighters = [
       getFighterManifest(selection.p1FighterKey),
       getFighterManifest(selection.p2FighterKey),
-    ];
+      getFighterManifest(selection.p1AssistKey),
+      getFighterManifest(selection.p2AssistKey),
+    ].filter((fighter, index, all) => all.findIndex((candidate) => candidate.key === fighter.key) === index);
     const stage = getStageManifest(selection.stageKey);
     let hasQueuedFiles = false;
+    const stageVideoPromise = stage.videoPath
+      ? this.waitForVideo(stage.videoPath)
+      : Promise.resolve(false);
 
     for (const fighter of fighters) {
       hasQueuedFiles = this.queueFighterMatchAssets(fighter) || hasQueuedFiles;
@@ -1476,7 +1932,12 @@ export class BattleScene extends Phaser.Scene {
       ...fighters.flatMap((fighter) => [fighter.special.beamAsset?.path, fighter.special.chargeAsset?.path]),
     ].filter((path): path is string => Boolean(path)));
     const domImagePromise = Promise.all([...domPaths].map((path) => this.waitForImage(path)));
-    await Promise.all([this.runQueuedLoader(hasQueuedFiles), domImagePromise]);
+    const [, stageVideoAvailable] = await Promise.all([
+      Promise.all([this.runQueuedLoader(hasQueuedFiles), domImagePromise]),
+      stageVideoPromise,
+    ]);
+    this.preparedStageVideoPath = stage.videoPath ?? null;
+    this.preparedStageVideoAvailable = stageVideoAvailable;
 
     this.ensureFallbackTextures(fighters);
     this.configureFighterTextureFiltering();
@@ -1513,6 +1974,35 @@ export class BattleScene extends Phaser.Scene {
       if (image.complete) {
         resolve();
       }
+    });
+  }
+
+  private waitForVideo(path: string) {
+    return new Promise<boolean>((resolve) => {
+      const video = document.createElement("video");
+      let settled = false;
+      let timeout = 0;
+      const finish = (available: boolean) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.clearTimeout(timeout);
+        video.removeAttribute("src");
+        video.load();
+        resolve(available);
+      };
+      timeout = window.setTimeout(() => {
+        finish(video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA);
+      }, 10000);
+      video.preload = "metadata";
+      video.muted = true;
+      video.playsInline = true;
+      video.addEventListener("loadeddata", () => finish(true), { once: true });
+      video.addEventListener("canplay", () => finish(true), { once: true });
+      video.addEventListener("error", () => finish(false), { once: true });
+      video.src = path;
+      video.load();
     });
   }
 
@@ -1631,9 +2121,13 @@ export class BattleScene extends Phaser.Scene {
     ]);
 
     for (const key of fighterTextureKeys) {
-      if (this.textures.exists(key)) {
-        this.textures.get(key).setFilter(Phaser.Textures.FilterMode.NEAREST);
-      }
+      this.setNearestTextureFilter(key);
+    }
+  }
+
+  private setNearestTextureFilter(textureKey: string) {
+    if (textureKey && this.textures.exists(textureKey)) {
+      this.textures.get(textureKey).setFilter(Phaser.Textures.FilterMode.NEAREST);
     }
   }
 
@@ -1706,9 +2200,9 @@ export class BattleScene extends Phaser.Scene {
 
   private createBackground() {
     const stage = getStageManifest(this.lastSelection.stageKey);
+    this.updateStageWorldConfig(stage);
     const bgKey = this.textures.exists(stage.key) ? stage.key : "missing-stage";
-    this.background = this.add.image(480, 270, bgKey);
-    this.background.setDisplaySize(960, 540);
+    this.createOrReplaceStageBackground(stage, bgKey);
     this.background.setDepth(-10);
     this.background.setAlpha(stage.usesDomBackground ? 0 : 1);
     this.applyDomStageBackground(stage);
@@ -1716,38 +2210,353 @@ export class BattleScene extends Phaser.Scene {
 
   private setStage(stageKey: string) {
     this.cleanupSpecialEffects();
+    this.cleanupStageVideo();
     const stage = getStageManifest(stageKey);
+    this.updateStageWorldConfig(stage);
     const textureKey = this.textures.exists(stage.key) ? stage.key : "missing-stage";
-    this.background?.setTexture(textureKey);
-    this.background?.setDisplaySize(960, 540);
-    this.background?.setAlpha(stage.usesDomBackground ? 0 : 1);
+    this.createOrReplaceStageBackground(stage, textureKey);
+    this.background.setDepth(-10);
+    this.background.setAlpha(stage.usesDomBackground ? 0 : 1);
+    this.updateFloorMarks();
+    this.fitBattleCamera();
     this.applyDomStageBackground(stage);
-    this.currentGroundY = stage.floorY ?? 474;
+    if (this.screen === "playing") {
+      this.startStageVideo(stage);
+    }
   }
 
-  private applyDomStageBackground(stage: { path: string; usesDomBackground?: boolean }) {
+  private isVideoStage(stage: StageAssetManifest) {
+    return stage.type === "video" || Boolean(stage.videoPath);
+  }
+
+  private startStageVideo(stage: StageAssetManifest) {
+    if (
+      !this.isVideoStage(stage) ||
+      !stage.videoPath ||
+      this.preparedStageVideoPath !== stage.videoPath ||
+      !this.preparedStageVideoAvailable
+    ) {
+      return;
+    }
     const root = document.getElementById("game-root");
     if (!root) {
       return;
     }
-    root.style.backgroundImage = stage.usesDomBackground ? `url("${stage.path}")` : "";
+
+    const video = document.createElement("video");
+    video.className = "stage-video-background";
+    video.setAttribute("aria-hidden", "true");
+    video.autoplay = true;
+    video.loop = true;
+    video.muted = true;
+    video.defaultMuted = true;
+    video.playsInline = true;
+    video.controls = false;
+    video.preload = "auto";
+    video.style.objectFit = stage.fitMode ?? "cover";
+    video.style.visibility = "hidden";
+    video.dataset.stageKey = stage.key;
+    const canvas = root.querySelector("canvas");
+    if (canvas) {
+      root.insertBefore(video, canvas);
+    } else {
+      root.prepend(video);
+    }
+    this.stageVideo = video;
+    this.stageVideoStageKey = stage.key;
+    this.stageVideoReady = false;
+
+    const reveal = () => {
+      if (this.stageVideo !== video || this.stageVideoStageKey !== stage.key) {
+        return;
+      }
+      this.stageVideoReady = true;
+      video.style.visibility = "visible";
+      this.updateStageVideoLayout();
+      this.applyDomStageBackground(stage);
+      void video.play().catch(() => this.installStageVideoUnlock(video));
+    };
+    video.addEventListener("loadeddata", reveal, { once: true });
+    video.addEventListener("canplay", reveal, { once: true });
+    video.addEventListener("error", () => {
+      if (this.stageVideo !== video) {
+        return;
+      }
+      this.cleanupStageVideo();
+      this.applyDomStageBackground(stage);
+    }, { once: true });
+    video.src = stage.videoPath;
+    video.load();
+    this.updateStageVideoLayout();
+  }
+
+  private installStageVideoUnlock(video: HTMLVideoElement) {
+    this.removeStageVideoUnlock();
+    const unlock = () => {
+      if (this.stageVideo === video) {
+        void video.play().catch(() => undefined);
+      }
+      this.removeStageVideoUnlock();
+    };
+    this.stageVideoUnlockHandler = unlock;
+    window.addEventListener("pointerdown", unlock);
+    window.addEventListener("keydown", unlock);
+  }
+
+  private removeStageVideoUnlock() {
+    if (!this.stageVideoUnlockHandler) {
+      return;
+    }
+    window.removeEventListener("pointerdown", this.stageVideoUnlockHandler);
+    window.removeEventListener("keydown", this.stageVideoUnlockHandler);
+    this.stageVideoUnlockHandler = null;
+  }
+
+  private cleanupStageVideo() {
+    this.removeStageVideoUnlock();
+    if (this.stageVideo) {
+      this.stageVideo.pause();
+      this.stageVideo.removeAttribute("src");
+      this.stageVideo.load();
+      this.stageVideo.remove();
+    }
+    this.stageVideo = null;
+    this.stageVideoStageKey = null;
+    this.stageVideoReady = false;
+  }
+
+  private updateStageVideoLayout() {
+    if (!this.stageVideo) {
+      return;
+    }
+    const camera = this.cameras.main;
+    const zoom = (camera.zoom || 1) * this.getCanvasDisplayScale();
+    const width = this.currentStageWidth * zoom;
+    const height = this.currentStageHeight * zoom;
+    this.stageVideo.style.width = `${width}px`;
+    this.stageVideo.style.height = `${height}px`;
+    this.stageVideo.style.left = `${-camera.scrollX * zoom}px`;
+    this.stageVideo.style.top = `${-camera.scrollY * zoom}px`;
+  }
+
+  private firstSelectableAssistIndex(mainIndex: number) {
+    for (let offset = 1; offset <= fighterManifests.length; offset += 1) {
+      const index = Phaser.Math.Wrap(mainIndex + offset, 0, fighterManifests.length);
+      if (this.isSelectableAssistIndex(index, mainIndex)) {
+        return index;
+      }
+    }
+    return mainIndex;
+  }
+
+  private unlockAudio() {
+    const soundManager = this.sound as unknown as {
+      context?: AudioContext;
+      unlock?: () => void;
+    };
+    soundManager.unlock?.();
+    const resumePromise = soundManager.context?.state === "suspended"
+      ? soundManager.context.resume()
+      : null;
+    if (resumePromise) {
+      void resumePromise
+        .then(() => {
+          if (this.screen !== "playing" && this.screen !== "paused") {
+            this.playMenuMusic();
+          }
+        })
+        .catch(() => undefined);
+    } else if (this.screen !== "playing" && this.screen !== "paused") {
+      this.playMenuMusic();
+    }
+  }
+
+  // Phaser's FIT mode keeps the world at 960x540 while CSS enlarges the
+  // canvas. DOM videos/backgrounds do not get that transform automatically,
+  // so convert logical world coordinates to the canvas's displayed pixels.
+  private getCanvasDisplayScale() {
+    const logicalWidth = Math.max(1, this.scale.width || logicalStageWidth);
+    const displayedWidth = this.game.canvas?.getBoundingClientRect().width ?? logicalWidth;
+    return Math.max(0.001, displayedWidth / logicalWidth);
+  }
+
+  private updateStageWorldConfig(stage: StageAssetManifest) {
+    this.currentStageWidth = Math.max(logicalStageWidth, stage.stageWidth ?? stageWorldDefaults.stageWidth);
+    this.currentStageHeight = Math.max(logicalStageHeight, stage.stageHeight ?? stageWorldDefaults.stageHeight);
+    this.currentStageScrolling = stage.scrolling ?? this.currentStageWidth > logicalStageWidth;
+    this.currentStageLeft = stageWorldDefaults.edgePadding;
+    this.currentStageRight = Math.max(
+      this.currentStageLeft + logicalStageWidth,
+      this.currentStageWidth - stageWorldDefaults.edgePadding,
+    );
+    const stageCenterX = this.currentStageWidth / 2;
+    this.currentCameraMinX = stage.cameraMinX ?? (this.currentStageScrolling ? logicalStageWidth / 2 : stageCenterX);
+    this.currentCameraMaxX = stage.cameraMaxX ?? (this.currentStageScrolling ? this.currentStageWidth - logicalStageWidth / 2 : stageCenterX);
+    this.currentGroundY = (stage.groundY ?? stage.floorY ?? 474) + stageWorldDefaults.fighterGroundOffset;
+  }
+
+  private createOrReplaceStageBackground(stage: StageAssetManifest, textureKey: string) {
+    const useTile = (stage.backgroundScaleMode ?? "tile") === "tile";
+    const backgroundIsTile = this.background instanceof Phaser.GameObjects.TileSprite;
+    if (this.background && backgroundIsTile !== useTile) {
+      this.background.destroy();
+      this.background = undefined as never;
+    }
+
+    if (!this.background) {
+      this.background = useTile
+        ? this.add.tileSprite(this.currentStageWidth / 2, this.currentStageHeight / 2, this.currentStageWidth, this.currentStageHeight, textureKey)
+        : this.add.image(this.currentStageWidth / 2, this.currentStageHeight / 2, textureKey);
+    } else {
+      this.background.setTexture(textureKey);
+    }
+
+    this.background.setPosition(this.currentStageWidth / 2, this.currentStageHeight / 2);
+    const texture = this.textures.get(textureKey);
+    const source = texture?.getSourceImage() as { width?: number; height?: number } | undefined;
+    const sourceWidth = Math.max(1, source?.width ?? logicalStageWidth);
+    const sourceHeight = Math.max(1, source?.height ?? logicalStageHeight);
+
+    if (this.background instanceof Phaser.GameObjects.TileSprite) {
+      this.background.setSize(this.currentStageWidth, this.currentStageHeight);
+      const tileScale = this.currentStageHeight / sourceHeight;
+      this.background.setTileScale(tileScale, tileScale);
+      this.background.setTilePosition(0, 0);
+      return;
+    }
+
+    const backgroundScaleMode = stage.backgroundScaleMode ?? "cover";
+    const scale =
+      backgroundScaleMode === "stretch"
+        ? 1
+        : backgroundScaleMode === "cover"
+          ? Math.max(this.currentStageWidth / sourceWidth, this.currentStageHeight / sourceHeight)
+          : this.currentStageHeight / sourceHeight;
+    this.background.setDisplaySize(
+      backgroundScaleMode === "stretch" ? this.currentStageWidth : sourceWidth * scale,
+      backgroundScaleMode === "stretch" ? this.currentStageHeight : sourceHeight * scale,
+    );
+  }
+
+  private applyDomStageBackground(stage: StageAssetManifest) {
+    const root = document.getElementById("game-root");
+    if (!root) {
+      return;
+    }
+    if (!stage.usesDomBackground) {
+      root.style.backgroundImage = "";
+      root.style.backgroundSize = "";
+      root.style.backgroundPosition = "";
+      root.style.backgroundRepeat = "";
+      return;
+    }
+
+    if (this.stageVideoReady && this.stageVideoStageKey === stage.key) {
+      root.style.backgroundImage = "none";
+      root.style.backgroundSize = "";
+      root.style.backgroundPosition = "";
+      root.style.backgroundRepeat = "no-repeat";
+      this.updateStageVideoLayout();
+      return;
+    }
+
+    const zoom = (this.cameras.main.zoom || 1) * this.getCanvasDisplayScale();
+    // Keep the existing image/GIF visible while the MP4 loads and use it as
+    // the automatic fallback if the browser cannot play the video.
+    root.style.backgroundImage = `url("${stage.path}")`;
+    root.style.backgroundRepeat = stage.backgroundScaleMode === "tile" ? "repeat-x" : "no-repeat";
+    root.style.backgroundSize =
+      stage.backgroundScaleMode === "stretch"
+        ? `${this.currentStageWidth * zoom}px ${this.currentStageHeight * zoom}px`
+        : `auto ${this.currentStageHeight * zoom}px`;
+    root.style.backgroundPosition = `${-this.cameras.main.scrollX * zoom}px ${-this.cameras.main.scrollY * zoom}px`;
   }
 
   private createFloorMarks() {
-    const ground = this.add.rectangle(480, this.currentGroundY + 29, 840, 5, 0xf4c84a, 0.72);
-    ground.setDepth(-1);
-    this.add.rectangle(480, 510, 960, 60, 0x06080c, 0.28).setDepth(-2);
+    // The stage artwork already contains its own floor treatment.
+  }
+
+  private updateFloorMarks() {
+    // Kept as a stage hook for future floor markers.
   }
 
   private fitBattleCamera() {
-    const { width, height } = this.scale.gameSize;
-    const zoom = Math.max(width / logicalStageWidth, height / logicalStageHeight);
-    this.cameras.main.setViewport(0, 0, width, height);
-    this.cameras.main.setZoom(zoom);
-    this.cameras.main.centerOn(logicalStageWidth / 2, logicalStageHeight / 2);
+    const width = Math.max(1, Math.round(this.scale.width || this.scale.gameSize.width || logicalStageWidth));
+    const height = Math.max(1, Math.round(this.scale.height || this.scale.gameSize.height || logicalStageHeight));
+    // Fit the complete 16:9 battle height. ENVELOP used the larger scale and
+    // cropped the arena, which could hide a fighter when browser zoom changed.
+    const zoom = Math.min(width / logicalStageWidth, height / logicalStageHeight);
+    const camera = this.cameras.main;
+    camera.setViewport(0, 0, width, height);
+    camera.setZoom(zoom);
+    camera.setBounds(0, 0, this.currentStageWidth, this.currentStageHeight);
+    if (this.sim) {
+      this.updateBattleCamera(this.sim.snapshot, true, 16);
+    } else {
+      const visibleWorldWidth = Math.max(1, camera.displayWidth);
+      const { minScrollX, maxScrollX } = this.getStageCameraScrollLimits(visibleWorldWidth);
+      const initialCenter = Phaser.Math.Clamp(
+        (this.currentCameraMinX + this.currentCameraMaxX) / 2,
+        minScrollX + visibleWorldWidth / 2,
+        maxScrollX + visibleWorldWidth / 2,
+      );
+      camera.scrollX = Phaser.Math.Clamp(initialCenter - visibleWorldWidth / 2, minScrollX, maxScrollX);
+      camera.scrollY = this.getStageCameraScrollY(camera);
+      this.applyDomStageBackground(getStageManifest(this.lastSelection.stageKey));
+    }
+  }
+
+  private scheduleCameraRefit() {
+    if (this.cameraRefitFrame !== null) {
+      cancelAnimationFrame(this.cameraRefitFrame);
+    }
+    this.cameraRefitFrame = requestAnimationFrame(() => {
+      this.cameraRefitFrame = requestAnimationFrame(() => {
+        this.cameraRefitFrame = null;
+        this.fitBattleCamera();
+      });
+    });
+  }
+
+  private updateBattleCamera(snapshot: RoundSnapshot, snap = false, deltaMs = 16) {
+    const camera = this.cameras.main;
+    const visibleWorldWidth = Math.max(1, camera.displayWidth);
+    const cameraHalfWidth = visibleWorldWidth / 2;
+    const { minScrollX, maxScrollX } = this.getStageCameraScrollLimits(visibleWorldWidth);
+    const minCenter = Math.max(minScrollX + cameraHalfWidth, this.currentCameraMinX);
+    const maxCenter = Math.min(maxScrollX + cameraHalfWidth, this.currentCameraMaxX);
+    const midpoint = (snapshot.fighters.p1.x + snapshot.fighters.p2.x) / 2;
+    const targetCenter = Phaser.Math.Clamp(midpoint, minCenter, Math.max(minCenter, maxCenter));
+    const currentCenter = camera.scrollX + cameraHalfWidth;
+    const smoothing = snap
+      ? 1
+      : 1 - Math.pow(1 - stageWorldDefaults.cameraFollowLerp, Math.max(0.25, deltaMs / 16));
+    const nextCenter = Phaser.Math.Linear(currentCenter, targetCenter, smoothing);
+    camera.scrollX = Phaser.Math.Clamp(nextCenter - cameraHalfWidth, minScrollX, maxScrollX);
+    camera.scrollY = this.getStageCameraScrollY(camera);
+    this.applyDomStageBackground(getStageManifest(this.lastSelection.stageKey));
+  }
+
+  private getStageCameraScrollLimits(visibleWorldWidth: number) {
+    const centeredScroll = (this.currentStageWidth - visibleWorldWidth) / 2;
+    const minScrollX = this.currentStageWidth <= visibleWorldWidth ? centeredScroll : 0;
+    const maxScrollX = Math.max(minScrollX, this.currentStageWidth - visibleWorldWidth);
+    return { minScrollX, maxScrollX };
+  }
+
+  private getStageCameraScrollY(camera: Phaser.Cameras.Scene2D.Camera) {
+    const visibleWorldHeight = Math.max(1, camera.displayHeight);
+    const maxScrollY = Math.max(0, this.currentStageHeight - visibleWorldHeight);
+    // Keep the floor at the familiar battle-line height even when an asset is
+    // taller than the 540-unit fighting viewport.
+    const preferredGroundScreenY = Math.min(visibleWorldHeight - 34, logicalStageHeight - 48);
+    return Phaser.Math.Clamp(this.currentGroundY - preferredGroundScreenY, 0, maxScrollY);
   }
 
   private destroyFighterViews() {
+    for (const view of this.fighterViews.values()) {
+      view.domImage?.remove();
+    }
     const staleViews: Phaser.GameObjects.GameObject[] = [];
     this.children.each((child) => {
       if (child.getData("fighterView")) {
@@ -1771,6 +2580,17 @@ export class BattleScene extends Phaser.Scene {
     );
   }
 
+  private setSpecialFrameDisplaySize(sprite: Phaser.GameObjects.Sprite, def: FighterAssetManifest) {
+    if (def.special.effect === "car-rush") {
+      sprite.setDisplaySize(300, 300);
+      return;
+    }
+    sprite.setDisplaySize(
+      Math.max(def.body.drawWidth * 1.28, 270),
+      Math.max(def.body.drawHeight * 1.22, 260),
+    );
+  }
+
   private createFighterView(
     id: FighterId,
     def: FighterAssetManifest,
@@ -1781,6 +2601,15 @@ export class BattleScene extends Phaser.Scene {
     const pose = def.poses.idle;
     const shadow = this.add.ellipse(x, y + 8, def.body.drawWidth * 0.62, 28, 0x000000, 0.34);
     const sprite = this.add.sprite(x, y, pose.key);
+    const domImage = document.createElement("img");
+    domImage.className = "fighter-dom-sprite";
+    domImage.alt = "";
+    domImage.draggable = false;
+    domImage.style.display = "none";
+    domImage.style.pointerEvents = "none";
+    domImage.style.position = "absolute";
+    domImage.style.zIndex = "3";
+    this.game.domContainer?.appendChild(domImage);
     sprite.setOrigin(0.5, 1);
     this.setFighterDisplaySize(sprite, def, 1);
     sprite.setFlipX(shouldFlipFighterAsset(def, "idle", facing));
@@ -1791,6 +2620,8 @@ export class BattleScene extends Phaser.Scene {
     this.fighterViews.set(id, {
       sprite,
       shadow,
+      domImage: this.game.domContainer ? domImage : null,
+      domTextureKey: null,
       lastPose: null,
       frameAnimation: { name: null, frameIndex: 0, nextFrameAtMs: 0 },
       effect: { offsetX: 0, offsetY: 0, angle: 0, scale: 1 },
@@ -1866,7 +2697,124 @@ export class BattleScene extends Phaser.Scene {
         view.sprite.setAlpha(revealed ? 1 : 0);
         view.shadow.setAlpha(revealed && fighter.grounded ? 0.34 : 0);
       }
+
+      this.syncFighterDomVisual(view);
     }
+  }
+
+  private syncFighterDomVisual(view: FighterView) {
+    const domImage = view.domImage;
+    if (!domImage) {
+      return;
+    }
+
+    const texture = view.sprite.texture;
+    const source = texture.getSourceImage();
+    const image = source instanceof HTMLImageElement ? source : null;
+    const frame = view.sprite.frame;
+    const isWholeImage =
+      image !== null &&
+      frame.cutX === 0 &&
+      frame.cutY === 0 &&
+      frame.cutWidth === image.naturalWidth &&
+      frame.cutHeight === image.naturalHeight;
+
+    // A DOM image preserves the source PNG detail at browser scale. Actual
+    // sheet animations keep Phaser's canvas renderer because they need a crop.
+    const sourcePath = this.textureAssetPaths.get(texture.key);
+    if (!sourcePath || !isWholeImage) {
+      domImage.style.display = "none";
+      view.sprite.setVisible(true);
+      return;
+    }
+
+    if (view.domTextureKey !== texture.key || domImage.dataset.sourcePath !== sourcePath) {
+      domImage.src = sourcePath;
+      domImage.dataset.sourcePath = sourcePath;
+      view.domTextureKey = texture.key;
+    }
+
+    if (!domImage.complete || domImage.naturalWidth === 0) {
+      domImage.style.display = "none";
+      view.sprite.setVisible(true);
+      return;
+    }
+
+    const container = this.game.domContainer;
+    const scale = container ? container.clientWidth / logicalStageWidth : 1;
+    const camera = this.cameras.main;
+    const screenX = (view.sprite.x - camera.scrollX) * camera.zoomX * scale;
+    const screenY = (view.sprite.y - camera.scrollY) * camera.zoomY * scale;
+    const width = Math.max(1, view.sprite.displayWidth * camera.zoomX * scale);
+    const height = Math.max(1, view.sprite.displayHeight * camera.zoomY * scale);
+
+    domImage.style.left = `${screenX}px`;
+    domImage.style.top = `${screenY}px`;
+    domImage.style.width = `${width}px`;
+    domImage.style.height = `${height}px`;
+    domImage.style.opacity = `${view.sprite.alpha}`;
+    domImage.style.display = view.sprite.alpha > 0.001 ? "block" : "none";
+    domImage.style.transformOrigin = "50% 100%";
+    domImage.style.transform = `translate(-50%, -100%) rotate(${view.sprite.angle}deg) scaleX(${view.sprite.flipX ? -1 : 1})`;
+    view.sprite.setVisible(false);
+  }
+
+  private syncAssistDomVisual() {
+    const view = this.assistView;
+    const domImage = view?.domImage;
+    if (!view || !domImage) {
+      return;
+    }
+
+    const texture = view.sprite.texture;
+    const source = texture.getSourceImage();
+    const image = source instanceof HTMLImageElement ? source : null;
+    const frame = view.sprite.frame;
+    const isWholeImage =
+      image !== null &&
+      frame.cutX === 0 &&
+      frame.cutY === 0 &&
+      frame.cutWidth === image.naturalWidth &&
+      frame.cutHeight === image.naturalHeight;
+    const sourcePath = this.textureAssetPaths.get(texture.key);
+
+    // Whole-image PNGs stay in the DOM path, matching the main fighter render.
+    // Sprite-sheet frames remain on Phaser's canvas because they need cropping.
+    if (!sourcePath || !isWholeImage) {
+      domImage.style.display = "none";
+      view.sprite.setVisible(true);
+      return;
+    }
+
+    if (view.domTextureKey !== texture.key || domImage.dataset.sourcePath !== sourcePath) {
+      domImage.src = sourcePath;
+      domImage.dataset.sourcePath = sourcePath;
+      view.domTextureKey = texture.key;
+    }
+
+    if (!domImage.complete || domImage.naturalWidth === 0) {
+      domImage.style.display = "none";
+      view.sprite.setVisible(true);
+      return;
+    }
+
+    const container = this.game.domContainer;
+    const scale = container ? container.clientWidth / logicalStageWidth : 1;
+    const camera = this.cameras.main;
+    const screenX = (view.sprite.x - camera.scrollX) * camera.zoomX * scale;
+    const screenY = (view.sprite.y - camera.scrollY) * camera.zoomY * scale;
+    const width = Math.max(1, view.sprite.displayWidth * camera.zoomX * scale);
+    const height = Math.max(1, view.sprite.displayHeight * camera.zoomY * scale);
+
+    domImage.style.left = `${screenX}px`;
+    domImage.style.top = `${screenY}px`;
+    domImage.style.width = `${width}px`;
+    domImage.style.height = `${height}px`;
+    domImage.style.opacity = `${view.sprite.alpha}`;
+    domImage.style.display = view.sprite.alpha > 0.001 ? "block" : "none";
+    domImage.style.transformOrigin = "50% 100%";
+    domImage.style.transform = `translate(-50%, -100%) rotate(${view.sprite.angle}deg) scaleX(${view.sprite.flipX ? -1 : 1})`;
+    view.sprite.setVisible(false);
   }
 
   private applyPose(view: FighterView, fighter: FighterState, poseName: PoseName) {
@@ -2096,8 +3044,8 @@ export class BattleScene extends Phaser.Scene {
     }
     if (!this.cache.audio.exists(track.key)) {
       this.stopMenuMusic();
-      void this.ensureMusicTrackLoaded(track).then(() => {
-        if (this.selectedMusicKey === track.key && this.screen !== "playing" && this.screen !== "paused") {
+      void this.ensureMusicTrackLoaded(track).then((loaded) => {
+        if (loaded && this.selectedMusicKey === track.key && this.screen !== "playing" && this.screen !== "paused") {
           this.playMenuMusic();
         }
       });
@@ -2146,8 +3094,8 @@ export class BattleScene extends Phaser.Scene {
     this.selectedMusicKey = nextTrack.key;
     this.saveMusicKey(nextTrack.key);
     this.stopMenuMusic();
-    void this.ensureMusicTrackLoaded(nextTrack).then(() => {
-      if (this.selectedMusicKey === nextTrack.key && this.screen !== "playing" && this.screen !== "paused") {
+    void this.ensureMusicTrackLoaded(nextTrack).then((loaded) => {
+      if (loaded && this.selectedMusicKey === nextTrack.key && this.screen !== "playing" && this.screen !== "paused") {
         this.playMenuMusic();
       }
     });
@@ -2155,10 +3103,23 @@ export class BattleScene extends Phaser.Scene {
 
   private ensureMusicTrackLoaded(track: { key: string; path: string }) {
     if (this.cache.audio.exists(track.key)) {
-      return Promise.resolve();
+      return Promise.resolve(true);
+    }
+    const pendingLoad = this.musicLoadPromises.get(track.key);
+    if (pendingLoad) {
+      return pendingLoad;
     }
     const queued = this.queueAudioFile(track.key, track.path);
-    return this.runQueuedLoader(queued);
+    if (!queued) {
+      return Promise.resolve(this.cache.audio.exists(track.key));
+    }
+
+    const load = this.runQueuedLoader(true)
+      .then(() => this.cache.audio.exists(track.key))
+      .catch(() => false)
+      .finally(() => this.musicLoadPromises.delete(track.key));
+    this.musicLoadPromises.set(track.key, load);
+    return load;
   }
 
   private stopMenuMusic() {
@@ -2416,6 +3377,317 @@ export class BattleScene extends Phaser.Scene {
     this.specialHtmlAudios = [];
   }
 
+  private playAssistStart(caller: FighterState, victim: FighterState, assist: FighterAssetManifest) {
+    this.cleanupAssist();
+    this.assistImpactSfxPlayed = false;
+    const runId = ++this.assistRunId;
+    const facing = caller.facing;
+    const x = Phaser.Math.Clamp(
+      caller.x - facing * assistPresentation.actorOffsetX,
+      this.currentStageLeft + 20,
+      this.currentStageRight - 20,
+    );
+    const y = caller.y;
+    const idle = assist.poses.idle;
+    const textureKey = this.textures.exists(idle.key) ? idle.key : assist.special.asset.key;
+    const shadow = this.add.ellipse(x, y + 8, assist.body.drawWidth * 0.58, 24, 0x000000, 0.32).setDepth(5);
+    const sprite = this.add.sprite(x, y, textureKey).setOrigin(0.5, 1).setDepth(8).setAlpha(0);
+    const domImage = document.createElement("img");
+    domImage.className = "fighter-dom-sprite assist-dom-sprite";
+    domImage.alt = "";
+    domImage.draggable = false;
+    domImage.style.display = "none";
+    domImage.style.pointerEvents = "none";
+    domImage.style.position = "absolute";
+    domImage.style.zIndex = "4";
+    this.game.domContainer?.appendChild(domImage);
+    this.setFighterDisplaySize(sprite, assist, 1);
+    this.setNearestTextureFilter(textureKey);
+    sprite.setFlipX(shouldFlipFighterAsset(assist, "idle", facing));
+    this.assistView = {
+      sprite,
+      shadow,
+      domImage: this.game.domContainer ? domImage : null,
+      domTextureKey: null,
+      def: assist,
+      callerId: caller.id,
+      facing,
+      x,
+      y,
+    };
+
+    const assistState: FighterState = {
+      ...caller,
+      def: assist,
+      x,
+      y,
+      facing,
+      pose: "idle",
+    };
+    // Start the activation line when the Partner is called, matching the
+    // normal special start event.
+    this.playSpecialVoice(assistState);
+
+    const asset = this.chooseSpawnEntranceVfx(null);
+    if (asset) {
+      const image = document.createElement("img");
+      image.className = "spawn-entrance-vfx assist-entrance-vfx";
+      image.alt = "";
+      image.draggable = false;
+      image.style.width = `${asset.width * 0.78}px`;
+      image.style.height = `${asset.height * 0.78}px`;
+      image.style.objectFit = "contain";
+      image.style.opacity = "0.94";
+      const dom = this.add.dom(x, y + 8, image).setOrigin(0.5, 1).setDepth(7).setScale(0.74);
+      this.assistEntranceDom = dom;
+      image.src = asset.path;
+      image.onerror = () => dom.setVisible(false);
+      this.assistTweens.push(this.tweens.add({
+        targets: dom,
+        scale: 0.98,
+        duration: ASSIST_ENTRANCE_MS,
+        ease: "Sine.easeOut",
+      }));
+    }
+    this.playSfx(extraSfxManifest.spawnEntrance.key, "roundStart", {
+      oneShot: true,
+      cooldownMs: 800,
+      volumeMultiplier: 1.05,
+    });
+
+    this.assistTimers.push(this.time.delayedCall(assistPresentation.revealMs, () => {
+      if (!this.isAssistCurrent(runId) || !this.assistView) return;
+      this.assistView.sprite.setAlpha(1);
+      this.assistView.shadow.setAlpha(0.34);
+      this.assistEntranceDom?.setAlpha(0.22);
+    }));
+    this.assistTimers.push(this.time.delayedCall(ASSIST_ENTRANCE_MS, () => {
+      if (!this.isAssistCurrent(runId)) return;
+      this.assistEntranceDom?.destroy();
+      this.assistEntranceDom = null;
+      this.playAssistSpecialPresentation(caller, victim, assist, runId);
+    }));
+  }
+
+  private playAssistSpecialPresentation(
+    caller: FighterState,
+    victim: FighterState,
+    assist: FighterAssetManifest,
+    runId: number,
+  ) {
+    const view = this.assistView;
+    if (!view || !this.isAssistCurrent(runId)) return;
+    const assistState: FighterState = {
+      ...caller,
+      def: assist,
+      x: view.x,
+      y: view.y,
+      facing: view.facing,
+      pose: "idle",
+    };
+    const overlay = this.createSpecialScreenOverlay(0.22, 4);
+    const assistLabelPoint = this.getFixedCameraPoint(
+      this.cameras.main.width / 2,
+      this.cameras.main.height * (112 / 540),
+    );
+    const label = this.trackSpecialObject(
+      this.add.text(assistLabelPoint.x, assistLabelPoint.y, assist.special.name, {
+        color: "#fff2a4",
+        fontFamily: arcadeFonts.display,
+        fontSize: `${34 / this.cameras.main.zoomX}px`,
+        fontStyle: "900",
+        stroke: "#000000",
+        strokeThickness: Math.max(2, Math.round(5 / this.cameras.main.zoomX)),
+      }).setOrigin(0.5).setDepth(13).setScrollFactor(0),
+    );
+    this.trackSpecialTimer(this.time.delayedCall(SPECIAL_NAME_DISPLAY_MS, () => label.destroy()));
+
+    const frames = assist.special.frameAssets ?? [];
+    const usableFrames = frames.length > 0 && frames.every((frame) => this.textures.exists(frame.key));
+    const frameDurations = usableFrames ? this.getSpecialFrameDurations(assistState) : [assist.special.durationMs];
+    const visualFrames = usableFrames ? frames : [{ key: assist.special.asset.key, sourceFacing: assist.special.asset.sourceFacing }];
+    let elapsedMs = 0;
+    const impactIndex = (assist.special.impactFrame ?? 4) - 1;
+    const isCarRush = assist.special.effect === "car-rush";
+    const isSuperFlight = assist.special.effect === "super-flight";
+    const originalX = view.x;
+    const originalY = view.y;
+    const startX = isCarRush
+      ? (view.facing === 1 ? this.currentStageLeft - 170 : this.currentStageRight + 170)
+      : originalX + (isSuperFlight ? view.facing * 24 : 0);
+    const endX = isCarRush
+      ? (view.facing === 1 ? this.currentStageRight + 170 : this.currentStageLeft - 170)
+      : isSuperFlight
+        ? Phaser.Math.Clamp(
+            victim.x - view.facing * 36,
+            this.currentStageLeft,
+            this.currentStageRight,
+          )
+        : originalX;
+
+    view.sprite.setDepth(12);
+    view.sprite.setOrigin(0.5, 1);
+    view.sprite.setPosition(startX, isCarRush ? originalY + 8 : originalY);
+    if (usableFrames) {
+      this.setSpecialFrameDisplaySize(view.sprite, assist);
+    }
+
+    let kamehamehaCharge: Phaser.GameObjects.DOMElement | null = null;
+    if (assist.special.effect === "kamehameha") {
+      kamehamehaCharge = this.playKamehamehaCharge(
+        assistState,
+        this.getSpecialFrameStartMs(assistState, assist.special.impactFrame ?? 4),
+      );
+    }
+
+    if (assist.special.effect === "mango-projectile") {
+      this.playMangoProjectileEffect(assistState, victim);
+    } else if (assist.special.effect === "satellite-strike") {
+      this.playSatelliteStrikeEffect(assistState, victim);
+    } else if (assist.special.effect === "car-rush" && !usableFrames) {
+      this.playCarRushEffect(assistState);
+    } else if (!usableFrames) {
+      this.playAssistFallbackSpecialEffect(assistState, victim);
+    }
+
+    const applyAssistFrame = (index: number) => {
+      const frame = visualFrames[index];
+      if (!frame || !this.isAssistCurrent(runId) || !this.assistView) return;
+      const sprite = this.assistView.sprite;
+      // Apply frame 1 immediately, then reuse the same sprite for every later frame.
+      // This prevents an assist from appearing stuck on its entrance/idle pose.
+      this.setNearestTextureFilter(frame.key);
+      sprite.setVisible(true).setAlpha(1).setTexture(frame.key);
+      sprite.setOrigin(0.5, 1);
+      sprite.setFlipX(shouldFlipSpecialFrameAsset(assist, Math.min(index, frames.length - 1), view.facing));
+      if (usableFrames) {
+        this.setSpecialFrameDisplaySize(sprite, assist);
+      } else {
+        this.setFighterDisplaySize(sprite, assist, 1);
+      }
+      if (assist.special.effect === "kamehameha" && kamehamehaCharge) {
+        if (index === 1) {
+          this.updateKamehamehaChargePosition(kamehamehaCharge, assistState, index);
+          kamehamehaCharge.setAlpha(1);
+        } else if (index === 2) {
+          this.updateKamehamehaChargePosition(kamehamehaCharge, assistState, index);
+        }
+      }
+      if (index === impactIndex) {
+        if (assist.special.effect === "ground-smash" || assist.special.effect === "barbell") {
+          this.cameras.main.shake(260, 0.012);
+        }
+        if (assist.special.effect === "kamehameha") {
+          if (kamehamehaCharge?.active) {
+            kamehamehaCharge.destroy();
+          }
+          kamehamehaCharge = null;
+          this.playKamehamehaBeam(assistState, victim, frameDurations[index] ?? SPECIAL_FRAME_MS);
+        }
+      }
+    };
+
+    for (const [index] of visualFrames.entries()) {
+      const frameStartMs = elapsedMs;
+      if (index === 0) {
+        applyAssistFrame(index);
+      } else {
+        this.trackSpecialTimer(this.time.delayedCall(frameStartMs, () => applyAssistFrame(index)));
+      }
+      elapsedMs += frameDurations[index] ?? SPECIAL_FRAME_MS;
+    }
+
+    this.assistTweens.push(this.tweens.add({
+      targets: view.sprite,
+      x: endX,
+      duration: elapsedMs,
+      ease: "Sine.easeInOut",
+      onComplete: () => {
+        if (view.sprite.active && !isCarRush) {
+          view.sprite.setPosition(originalX, originalY);
+        }
+      },
+    }));
+
+    this.trackSpecialTimer(this.time.delayedCall(elapsedMs + ASSIST_EXIT_MS, () => {
+      if (!this.isAssistCurrent(runId) || !this.assistView) return;
+      this.assistTweens.push(this.tweens.add({
+        targets: [this.assistView.sprite, this.assistView.shadow],
+        alpha: 0,
+        duration: assistPresentation.exitMs,
+      }));
+    }));
+  }
+
+  private playAssistFallbackSpecialEffect(attacker: FighterState, victim: FighterState) {
+    if (attacker.def.special.effect === "super-flight") {
+      const sprite = this.createSpecialSprite(attacker, 220, 150);
+      sprite.setPosition(attacker.x, attacker.y - 120);
+      this.trackSpecialTween(this.tweens.add({
+        targets: sprite,
+        x: victim.x - attacker.facing * 34,
+        y: victim.y - 126,
+        duration: 760,
+        ease: "Back.easeIn",
+        yoyo: true,
+        hold: 80,
+        onComplete: () => sprite.destroy(),
+      }));
+      return;
+    }
+    if (attacker.def.special.effect === "ground-smash") {
+      const sprite = this.createSpecialSprite(attacker, 250, 190);
+      sprite.setPosition(attacker.x, attacker.y);
+      this.trackSpecialTween(this.tweens.add({
+        targets: sprite,
+        alpha: 0,
+        scaleX: 1.32,
+        scaleY: 1.12,
+        duration: 1180,
+        onComplete: () => sprite.destroy(),
+      }));
+      return;
+    }
+    if (attacker.def.special.effect === "barbell") {
+      this.playBarbellEffect(attacker, victim);
+      return;
+    }
+    if (attacker.def.special.effect === "fishing-trap") {
+      this.playFishingTrapEffect(attacker, victim);
+      return;
+    }
+    if (attacker.def.special.effect === "kamehameha") {
+      this.playKamehamehaFallbackEffect(attacker, victim);
+      return;
+    }
+    this.playRasenganEffect(attacker, victim);
+  }
+
+  private isAssistCurrent(runId: number) {
+    return this.assistRunId === runId && this.screen === "playing" && !this.roundEndHandled && Boolean(this.assistView);
+  }
+
+  private cleanupAssist() {
+    this.assistRunId += 1;
+    this.assistImpactSfxPlayed = false;
+    for (const timer of this.assistTimers) timer.remove(false);
+    this.assistTimers = [];
+    for (const tween of this.assistTweens) {
+      tween.stop();
+      tween.remove();
+    }
+    this.assistTweens = [];
+    this.assistEntranceDom?.destroy();
+    this.assistEntranceDom = null;
+    if (this.assistView) {
+      this.assistView.domImage?.remove();
+      this.assistView.sprite.destroy();
+      this.assistView.shadow.destroy();
+      this.assistView = null;
+    }
+    this.cleanupSpecialEffects();
+  }
+
   private playAttackImpactVfx(attacker: FighterState, victim: FighterState, attackName: AttackName | "block") {
     const config = attackVfxManifest[attackName];
     if (!config) {
@@ -2463,19 +3735,22 @@ export class BattleScene extends Phaser.Scene {
     this.playSpecialVoice(attacker);
     this.playSfx(sfxManifest.roundStart.key, "roundStart");
 
-    const overlay = this.trackSpecialObject(this.add.rectangle(480, 270, 960, 540, 0x000000, 0.54));
-    overlay.setDepth(5);
+    const overlay = this.createSpecialScreenOverlay(0.3, 5);
+    const specialLabelPoint = this.getFixedCameraPoint(
+      this.cameras.main.width / 2,
+      this.cameras.main.height * (130 / 540),
+    );
 
     const special = attacker.def.special;
     const label = this.trackSpecialObject(
       this.add
-        .text(480, 130, special.name, {
+        .text(specialLabelPoint.x, specialLabelPoint.y, special.name, {
           color: "#fff2a4",
           fontFamily: arcadeFonts.display,
-          fontSize: "42px",
+          fontSize: `${42 / this.cameras.main.zoomX}px`,
           fontStyle: "900",
           stroke: "#000000",
-          strokeThickness: 6,
+          strokeThickness: Math.max(2, Math.round(6 / this.cameras.main.zoomX)),
           shadow: {
             offsetX: 0,
             offsetY: 4,
@@ -2486,7 +3761,8 @@ export class BattleScene extends Phaser.Scene {
           },
         })
         .setOrigin(0.5)
-        .setDepth(13),
+        .setDepth(13)
+        .setScrollFactor(0),
     );
 
     const casterView = this.fighterViews.get(attacker.id);
@@ -2570,6 +3846,25 @@ export class BattleScene extends Phaser.Scene {
       attacker.def.special.durationMs +
       (attacker.def.special.impactHoldMs ?? 180) +
       (attacker.def.special.recoveryMs ?? SPECIAL_RECOVERY_MS)
+    );
+  }
+
+  private getFixedCameraPoint(screenX: number, screenY: number) {
+    const camera = this.cameras.main;
+    return {
+      x: camera.width / 2 + (screenX - camera.width / 2) / camera.zoomX,
+      y: camera.height / 2 + (screenY - camera.height / 2) / camera.zoomY,
+    };
+  }
+
+  private createSpecialScreenOverlay(alpha: number, depth: number) {
+    const camera = this.cameras.main;
+    const center = this.getFixedCameraPoint(camera.width / 2, camera.height / 2);
+    return this.trackSpecialObject(
+      this.add
+        .rectangle(center.x, center.y, camera.displayWidth, camera.displayHeight, 0x000000, alpha)
+        .setDepth(depth)
+        .setScrollFactor(0),
     );
   }
 
@@ -2658,8 +3953,8 @@ export class BattleScene extends Phaser.Scene {
 
   private playCarRushEffect(attacker: FighterState) {
     const sprite = this.createSpecialSprite(attacker, 260, 150);
-    const startX = attacker.facing === 1 ? -150 : 1110;
-    const endX = attacker.facing === 1 ? 1110 : -150;
+    const startX = attacker.facing === 1 ? this.currentStageLeft - 150 : this.currentStageRight + 150;
+    const endX = attacker.facing === 1 ? this.currentStageRight + 150 : this.currentStageLeft - 150;
     sprite.setPosition(startX, attacker.y + 8);
     this.trackSpecialTween(this.tweens.add({
       targets: sprite,
@@ -2685,19 +3980,24 @@ export class BattleScene extends Phaser.Scene {
       attacker.def.special.effect === "satellite-strike" ||
       attacker.def.special.effect === "kamehameha";
     const startX = isCarRush
-      ? (attacker.facing === 1 ? -170 : 1130)
+      ? (attacker.facing === 1 ? this.currentStageLeft - 170 : this.currentStageRight + 170)
       : attacker.x + (isStationaryCaster ? 0 : attacker.facing * 24);
     const endX = isCarRush
-      ? (attacker.facing === 1 ? 1130 : -170)
+      ? (attacker.facing === 1 ? this.currentStageRight + 170 : this.currentStageLeft - 170)
       : isSuperFlight
-        ? Phaser.Math.Clamp(attacker.x + attacker.facing * attacker.def.special.range, 80, 880)
+        ? Phaser.Math.Clamp(
+            attacker.x + attacker.facing * attacker.def.special.range,
+            this.currentStageLeft,
+            this.currentStageRight,
+          )
         : isStationaryCaster
         ? startX
-        : Phaser.Math.Clamp(victim.x - attacker.facing * 36, 80, 880);
+        : Phaser.Math.Clamp(victim.x - attacker.facing * 36, this.currentStageLeft, this.currentStageRight);
     const y = isCarRush ? attacker.y + 8 : attacker.y;
     const width = isCarRush ? 300 : Math.max(attacker.def.body.drawWidth * 1.28, 270);
     const height = isCarRush ? 300 : Math.max(attacker.def.body.drawHeight * 1.22, 260);
     const sprite = this.trackSpecialObject(this.add.sprite(startX, y, frames[0].key));
+    this.setNearestTextureFilter(frames[0].key);
     sprite.setOrigin(0.5, 1);
     sprite.setDisplaySize(width, height);
     sprite.setDepth(9);
@@ -2731,6 +4031,7 @@ export class BattleScene extends Phaser.Scene {
           if (!sprite.active) {
             return;
           }
+          this.setNearestTextureFilter(frame.key);
           sprite.setTexture(frame.key);
           sprite.setFlipX(shouldFlipSpecialFrameAsset(attacker.def, index, attacker.facing));
           if (attacker.def.special.effect === "kamehameha" && kamehamehaCharge) {
@@ -2806,7 +4107,11 @@ export class BattleScene extends Phaser.Scene {
         const targetIsInFront = attacker.facing === 1 ? victim.x >= attacker.x : victim.x <= attacker.x;
         const startX = attacker.x + attacker.facing * 78;
         const startY = attacker.y - 128;
-        const targetX = targetIsInFront ? victim.x - attacker.facing * 16 : attacker.facing === 1 ? 1080 : -120;
+        const targetX = targetIsInFront
+          ? victim.x - attacker.facing * 16
+          : attacker.facing === 1
+            ? this.currentStageRight + 120
+            : this.currentStageLeft - 120;
         const targetY = targetIsInFront ? victim.y - 116 : startY;
         projectile.setPosition(startX, startY);
         projectile.setDisplaySize(88, 70);
@@ -2929,8 +4234,8 @@ export class BattleScene extends Phaser.Scene {
     const startX = attacker.x + attacker.facing * 78;
     const targetX = Phaser.Math.Clamp(
       victim.x - attacker.facing * 28,
-      attacker.facing === 1 ? startX + 120 : 80,
-      attacker.facing === 1 ? 880 : startX - 120,
+      attacker.facing === 1 ? startX + 120 : this.currentStageLeft,
+      attacker.facing === 1 ? this.currentStageRight : startX - 120,
     );
     const beamLength = Phaser.Math.Clamp(Math.abs(targetX - startX) + 80, 240, 700);
     const beamY = attacker.y - 132;
@@ -2980,8 +4285,8 @@ export class BattleScene extends Phaser.Scene {
     const startX = attacker.x + attacker.facing * 78;
     const targetX = Phaser.Math.Clamp(
       victim.x - attacker.facing * 28,
-      attacker.facing === 1 ? startX + 120 : 80,
-      attacker.facing === 1 ? 880 : startX - 120,
+      attacker.facing === 1 ? startX + 120 : this.currentStageLeft,
+      attacker.facing === 1 ? this.currentStageRight : startX - 120,
     );
     const y = attacker.y - 132;
     const beam = this.trackSpecialObject(this.add.graphics().setDepth(12));
@@ -3002,9 +4307,11 @@ export class BattleScene extends Phaser.Scene {
 
   private playSatelliteStrikeEffect(attacker: FighterState, victim: FighterState) {
     const impactMs = this.getSpecialImpactVisualMs(attacker);
-    const targetX = Phaser.Math.Clamp(victim.x, 92, 868);
+    const targetX = Phaser.Math.Clamp(victim.x, this.currentStageLeft, this.currentStageRight);
     const targetY = victim.y - 68;
-    const warning = this.trackSpecialObject(this.add.ellipse(targetX, 463, 132, 34, 0xff3b30, 0.28));
+    const warning = this.trackSpecialObject(
+      this.add.ellipse(targetX, this.currentGroundY - 39, 132, 34, 0xff3b30, 0.28),
+    );
     warning.setDepth(6);
     warning.setStrokeStyle(4, 0xfff1a6, 0.9);
     this.trackSpecialTween(
@@ -3245,6 +4552,18 @@ export class BattleScene extends Phaser.Scene {
 
   private playRoundAnnouncementSfx() {
     const roundNumber = this.currentRoundNumber();
+    if (roundNumber === 1 && this.cache.audio.exists(extraSfxManifest.round1Fight.key)) {
+      const played = this.playSfx(extraSfxManifest.round1Fight.key, "roundStart", {
+        oneShot: true,
+        cooldownMs: 1200,
+        volumeMultiplier: audioConfig.fightVolumeMultiplier,
+        allowBoost: true,
+      });
+      if (played) {
+        this.roundStartSoundHandled = true;
+        return;
+      }
+    }
     const announcement = extraSfxManifest.roundAnnouncements[roundNumber - 1];
     if (
       announcement &&
@@ -3545,10 +4864,21 @@ export class BattleScene extends Phaser.Scene {
 
   private normalizeSelection(selection: RoundSelection): RoundSelection {
     const fallback = fighterManifests.find(isFighterPlayable) ?? fighterManifests[0];
+    const p1Main = getFighterManifest(selection.p1FighterKey);
+    const p2Main = getFighterManifest(selection.p2FighterKey);
+    const resolveAssist = (key: string, mainKey: string) => {
+      const selected = getFighterManifest(key);
+      if (assistPresentation.allowSameCharacterAsAssist || selected.key !== mainKey) {
+        return selected.key;
+      }
+      return fighterManifests.find((fighter) => isFighterPlayable(fighter) && fighter.key !== mainKey)?.key ?? selected.key;
+    };
     return {
       ...selection,
-      p1FighterKey: getFighterManifest(selection.p1FighterKey).key ?? fallback.key,
-      p2FighterKey: getFighterManifest(selection.p2FighterKey).key ?? fallback.key,
+      p1FighterKey: p1Main.key ?? fallback.key,
+      p2FighterKey: p2Main.key ?? fallback.key,
+      p1AssistKey: resolveAssist(selection.p1AssistKey, p1Main.key),
+      p2AssistKey: resolveAssist(selection.p2AssistKey, p2Main.key),
     };
   }
 
@@ -3557,6 +4887,13 @@ export class BattleScene extends Phaser.Scene {
       .map((_fighter, index) => index)
       .filter((index) => index !== excludedIndex && this.isPlayableFighterIndex(index));
     return Phaser.Utils.Array.GetRandom(options) ?? Math.max(0, fighterManifests.findIndex(isFighterPlayable));
+  }
+
+  private randomCpuAssistIndex(mainIndex: number) {
+    const options = fighterManifests
+      .map((_fighter, index) => index)
+      .filter((index) => this.isSelectableAssistIndex(index, mainIndex));
+    return Phaser.Utils.Array.GetRandom(options) ?? this.randomCpuFighterIndex(mainIndex);
   }
 
   private just(key: Phaser.Input.Keyboard.Key) {

@@ -7,6 +7,7 @@ export type RoundStatus = "menu" | "playing" | "ko" | "time";
 export type FighterId = "p1" | "p2";
 export type SpecialPhase = "idle" | "intro" | "active" | "impact" | "recovery" | "cleanup";
 export type ThrowPhase = "idle" | "startup" | "lift" | "slam" | "impact" | "recovery" | "whiff";
+export type AssistPhase = "idle" | "entrance" | "active" | "impact" | "recovery";
 
 export type ActiveAttack = {
   config: AttackConfig;
@@ -34,6 +35,15 @@ export type ThrowSequenceState = {
   slideTargetX: number | null;
 };
 
+export type AssistSequenceState = {
+  phase: AssistPhase;
+  callerId: FighterId | null;
+  victimId: FighterId | null;
+  elapsedMs: number;
+  phaseElapsedMs: number;
+  hasHit: boolean;
+};
+
 export type FighterState = {
   id: FighterId;
   def: FighterAssetManifest;
@@ -52,6 +62,7 @@ export type FighterState = {
   attackCooldowns: Record<AttackName, number>;
   activeAttack: ActiveAttack | null;
   specialMeter: number;
+  assistMeter: number;
 };
 
 export type RoundSnapshot = {
@@ -62,4 +73,5 @@ export type RoundSnapshot = {
   fighters: Record<FighterId, FighterState>;
   specialSequence: SpecialSequenceState;
   throwSequence: ThrowSequenceState;
+  assistSequence: AssistSequenceState;
 };

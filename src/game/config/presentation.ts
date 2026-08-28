@@ -27,7 +27,8 @@ export const refereeRoundIntroPresentation = {
   auraWidth: 360,
   auraAlpha: 0.64,
   stageX: 480,
-  stageY: 330,
+  // Keep the referee's feet near the fighters' ground line.
+  stageY: 408,
   startY: -175,
   auraOffsetY: -16,
 } as const;
@@ -43,4 +44,13 @@ export const spawnEntrancePresentation = {
   revealEffectAlpha: 0.18,
   fallbackFlashMs: 520,
   fallbackColor: 0x65d9ff,
+} as const;
+
+export const assistPresentation = {
+  allowSameCharacterAsAssist: false,
+  entranceMs: 650,
+  revealMs: 330,
+  exitMs: 320,
+  entranceScale: 0.82,
+  actorOffsetX: 76,
 } as const;
