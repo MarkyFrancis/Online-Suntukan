@@ -41,6 +41,14 @@ if (gameWindow.__bsuFighterGame) {
 
 gameWindow.__bsuFighterGame = new Phaser.Game(config);
 
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch(() => {
+      // Installation remains optional; the game should still run normally.
+    });
+  });
+}
+
 if (import.meta.hot) {
   import.meta.hot.dispose(() => {
     gameWindow.__bsuFighterGame?.destroy(true);
