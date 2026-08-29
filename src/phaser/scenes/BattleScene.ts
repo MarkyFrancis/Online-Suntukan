@@ -219,6 +219,9 @@ export class BattleScene extends Phaser.Scene {
   private specialEffectTimers: Phaser.Time.TimerEvent[] = [];
   private specialEffectTweens: Phaser.Tweens.Tween[] = [];
   private specialHtmlAudios: HTMLAudioElement[] = [];
+  private specialActorDomImage: HTMLImageElement | null = null;
+  private specialActorDomSprite: Phaser.GameObjects.Sprite | null = null;
+  private specialActorDomTextureKey: string | null = null;
   private vfxObjects: Phaser.GameObjects.GameObject[] = [];
   private vfxTweens: Phaser.Tweens.Tween[] = [];
   private vfxTimers: Phaser.Time.TimerEvent[] = [];
@@ -367,6 +370,7 @@ export class BattleScene extends Phaser.Scene {
       this.updateBattleCamera(this.sim.snapshot, false, clampedDelta);
       this.syncViews(this.sim.snapshot);
       this.syncAssistDomVisual();
+      this.syncSpecialActorDomVisual();
       this.ui.updateHud(this.sim.snapshot, this.score);
       return;
     }
@@ -394,6 +398,7 @@ export class BattleScene extends Phaser.Scene {
     this.updateBattleCamera(this.sim.snapshot, false, clampedDelta);
     this.syncViews(this.sim.snapshot);
     this.syncAssistDomVisual();
+    this.syncSpecialActorDomVisual();
     this.ui.updateHud(this.sim.snapshot, this.score);
   }
 
@@ -568,7 +573,10 @@ export class BattleScene extends Phaser.Scene {
       },
       onThrowImpact: (attacker, victim) => {
         this.playThrowImpactVfx(attacker, victim);
-        this.playSfx(sfxManifest.kickHit.key, "kickHit", { cooldownMs: 200 });
+        this.playSfx(extraSfxManifest.bodyThrowImpact.key, "kickHit", {
+          oneShot: true,
+          cooldownMs: 1200,
+        });
         this.playHurtVoice(victim);
         this.cameras.main.shake(150, 0.008);
       },
@@ -2703,118 +2711,86 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private syncFighterDomVisual(view: FighterView) {
-    const domImage = view.domImage;
-    if (!domImage) {
+    if (!view.domImage) {
       return;
     }
-
-    const texture = view.sprite.texture;
-    const source = texture.getSourceImage();
-    const image = source instanceof HTMLImageElement ? source : null;
-    const frame = view.sprite.frame;
-    const isWholeImage =
-      image !== null &&
-      frame.cutX === 0 &&
-      frame.cutY === 0 &&
-      frame.cutWidth === image.naturalWidth &&
-      frame.cutHeight === image.naturalHeight;
-
-    // A DOM image preserves the source PNG detail at browser scale. Actual
-    // sheet animations keep Phaser's canvas renderer because they need a crop.
-    const sourcePath = this.textureAssetPaths.get(texture.key);
-    if (!sourcePath || !isWholeImage) {
-      domImage.style.display = "none";
-      view.sprite.setVisible(true);
-      return;
-    }
-
-    if (view.domTextureKey !== texture.key || domImage.dataset.sourcePath !== sourcePath) {
-      domImage.src = sourcePath;
-      domImage.dataset.sourcePath = sourcePath;
-      view.domTextureKey = texture.key;
-    }
-
-    if (!domImage.complete || domImage.naturalWidth === 0) {
-      domImage.style.display = "none";
-      view.sprite.setVisible(true);
-      return;
-    }
-
-    const container = this.game.domContainer;
-    const scale = container ? container.clientWidth / logicalStageWidth : 1;
-    const camera = this.cameras.main;
-    const screenX = (view.sprite.x - camera.scrollX) * camera.zoomX * scale;
-    const screenY = (view.sprite.y - camera.scrollY) * camera.zoomY * scale;
-    const width = Math.max(1, view.sprite.displayWidth * camera.zoomX * scale);
-    const height = Math.max(1, view.sprite.displayHeight * camera.zoomY * scale);
-
-    domImage.style.left = `${screenX}px`;
-    domImage.style.top = `${screenY}px`;
-    domImage.style.width = `${width}px`;
-    domImage.style.height = `${height}px`;
-    domImage.style.opacity = `${view.sprite.alpha}`;
-    domImage.style.display = view.sprite.alpha > 0.001 ? "block" : "none";
-    domImage.style.transformOrigin = "50% 100%";
-    domImage.style.transform = `translate(-50%, -100%) rotate(${view.sprite.angle}deg) scaleX(${view.sprite.flipX ? -1 : 1})`;
-    view.sprite.setVisible(false);
+    view.domTextureKey = this.syncCrispDomVisual(view.sprite, view.domImage, view.domTextureKey);
   }
 
   private syncAssistDomVisual() {
     const view = this.assistView;
-    const domImage = view?.domImage;
-    if (!view || !domImage) {
+    if (!view?.domImage) {
       return;
     }
+    view.domTextureKey = this.syncCrispDomVisual(view.sprite, view.domImage, view.domTextureKey);
+  }
 
-    const texture = view.sprite.texture;
+  private syncSpecialActorDomVisual() {
+    if (!this.specialActorDomSprite || !this.specialActorDomImage) {
+      return;
+    }
+    this.specialActorDomTextureKey = this.syncCrispDomVisual(
+      this.specialActorDomSprite,
+      this.specialActorDomImage,
+      this.specialActorDomTextureKey,
+    );
+  }
+
+  private syncCrispDomVisual(
+    sprite: Phaser.GameObjects.Sprite,
+    domImage: HTMLImageElement,
+    domTextureKey: string | null,
+  ) {
+    const texture = sprite.texture;
     const source = texture.getSourceImage();
     const image = source instanceof HTMLImageElement ? source : null;
-    const frame = view.sprite.frame;
+    const frame = sprite.frame;
     const isWholeImage =
       image !== null &&
       frame.cutX === 0 &&
       frame.cutY === 0 &&
       frame.cutWidth === image.naturalWidth &&
       frame.cutHeight === image.naturalHeight;
-    const sourcePath = this.textureAssetPaths.get(texture.key);
 
-    // Whole-image PNGs stay in the DOM path, matching the main fighter render.
-    // Sprite-sheet frames remain on Phaser's canvas because they need cropping.
+    // A DOM image preserves the source PNG detail at browser scale. Cropped
+    // spritesheet frames stay on Phaser because they need a texture crop.
+    const sourcePath = this.textureAssetPaths.get(texture.key);
     if (!sourcePath || !isWholeImage) {
       domImage.style.display = "none";
-      view.sprite.setVisible(true);
-      return;
+      sprite.setVisible(true);
+      return domTextureKey;
     }
 
-    if (view.domTextureKey !== texture.key || domImage.dataset.sourcePath !== sourcePath) {
+    if (domTextureKey !== texture.key || domImage.dataset.sourcePath !== sourcePath) {
       domImage.src = sourcePath;
       domImage.dataset.sourcePath = sourcePath;
-      view.domTextureKey = texture.key;
+      domTextureKey = texture.key;
     }
 
     if (!domImage.complete || domImage.naturalWidth === 0) {
       domImage.style.display = "none";
-      view.sprite.setVisible(true);
-      return;
+      sprite.setVisible(true);
+      return domTextureKey;
     }
 
     const container = this.game.domContainer;
     const scale = container ? container.clientWidth / logicalStageWidth : 1;
     const camera = this.cameras.main;
-    const screenX = (view.sprite.x - camera.scrollX) * camera.zoomX * scale;
-    const screenY = (view.sprite.y - camera.scrollY) * camera.zoomY * scale;
-    const width = Math.max(1, view.sprite.displayWidth * camera.zoomX * scale);
-    const height = Math.max(1, view.sprite.displayHeight * camera.zoomY * scale);
+    const screenX = (sprite.x - camera.scrollX) * camera.zoomX * scale;
+    const screenY = (sprite.y - camera.scrollY) * camera.zoomY * scale;
+    const width = Math.max(1, sprite.displayWidth * camera.zoomX * scale);
+    const height = Math.max(1, sprite.displayHeight * camera.zoomY * scale);
 
     domImage.style.left = `${screenX}px`;
     domImage.style.top = `${screenY}px`;
     domImage.style.width = `${width}px`;
     domImage.style.height = `${height}px`;
-    domImage.style.opacity = `${view.sprite.alpha}`;
-    domImage.style.display = view.sprite.alpha > 0.001 ? "block" : "none";
+    domImage.style.opacity = `${sprite.alpha}`;
+    domImage.style.display = sprite.alpha > 0.001 ? "block" : "none";
     domImage.style.transformOrigin = "50% 100%";
-    domImage.style.transform = `translate(-50%, -100%) rotate(${view.sprite.angle}deg) scaleX(${view.sprite.flipX ? -1 : 1})`;
-    view.sprite.setVisible(false);
+    domImage.style.transform = `translate(-50%, -100%) rotate(${sprite.angle}deg) scaleX(${sprite.flipX ? -1 : 1})`;
+    sprite.setVisible(false);
+    return domTextureKey;
   }
 
   private applyPose(view: FighterView, fighter: FighterState, poseName: PoseName) {
@@ -3324,6 +3300,11 @@ export class BattleScene extends Phaser.Scene {
   private cleanupSpecialEffects() {
     this.cleanupVfx();
 
+    this.specialActorDomImage?.remove();
+    this.specialActorDomImage = null;
+    this.specialActorDomSprite = null;
+    this.specialActorDomTextureKey = null;
+
     for (const timer of this.specialEffectTimers) {
       timer.remove(false);
     }
@@ -3510,11 +3491,15 @@ export class BattleScene extends Phaser.Scene {
     const impactIndex = (assist.special.impactFrame ?? 4) - 1;
     const isCarRush = assist.special.effect === "car-rush";
     const isSuperFlight = assist.special.effect === "super-flight";
+    const isStationaryCaster =
+      assist.special.effect === "mango-projectile" ||
+      assist.special.effect === "satellite-strike" ||
+      assist.special.effect === "kamehameha";
     const originalX = view.x;
     const originalY = view.y;
     const startX = isCarRush
       ? (view.facing === 1 ? this.currentStageLeft - 170 : this.currentStageRight + 170)
-      : originalX + (isSuperFlight ? view.facing * 24 : 0);
+      : originalX + (isStationaryCaster ? 0 : view.facing * 24);
     const endX = isCarRush
       ? (view.facing === 1 ? this.currentStageRight + 170 : this.currentStageLeft - 170)
       : isSuperFlight
@@ -3523,7 +3508,9 @@ export class BattleScene extends Phaser.Scene {
             this.currentStageLeft,
             this.currentStageRight,
           )
-        : originalX;
+        : isStationaryCaster
+          ? startX
+          : Phaser.Math.Clamp(victim.x - view.facing * 36, this.currentStageLeft, this.currentStageRight);
 
     view.sprite.setDepth(12);
     view.sprite.setOrigin(0.5, 1);
@@ -4003,6 +3990,22 @@ export class BattleScene extends Phaser.Scene {
     sprite.setDepth(9);
     sprite.setFlipX(shouldFlipSpecialFrameAsset(attacker.def, 0, attacker.facing));
 
+    // Special frame PNGs are whole images, so keep them in the same browser
+    // image path as normal fighters. Phaser's canvas scaling made these frames
+    // noticeably softer during the cinematic.
+    const domImage = document.createElement("img");
+    domImage.className = "fighter-dom-sprite special-dom-sprite";
+    domImage.alt = "";
+    domImage.draggable = false;
+    domImage.style.display = "none";
+    domImage.style.pointerEvents = "none";
+    domImage.style.position = "absolute";
+    domImage.style.zIndex = "5";
+    this.game.domContainer?.appendChild(domImage);
+    this.specialActorDomImage = this.game.domContainer ? domImage : null;
+    this.specialActorDomSprite = this.game.domContainer ? sprite : null;
+    this.specialActorDomTextureKey = null;
+
     const casterView = this.fighterViews.get(attacker.id);
     if (casterView) {
       casterView.sprite.setAlpha(0);
@@ -4069,6 +4072,12 @@ export class BattleScene extends Phaser.Scene {
         ease: "Sine.easeInOut",
         onComplete: () => {
           sprite.destroy();
+          if (this.specialActorDomSprite === sprite) {
+            this.specialActorDomImage?.remove();
+            this.specialActorDomImage = null;
+            this.specialActorDomSprite = null;
+            this.specialActorDomTextureKey = null;
+          }
           if (casterView) {
             casterView.sprite.setAlpha(1);
             casterView.sprite.clearTint();
@@ -4443,6 +4452,7 @@ export class BattleScene extends Phaser.Scene {
   private createSpecialSprite(attacker: FighterState, width: number, height: number) {
     const special = attacker.def.special;
     const sprite = this.trackSpecialObject(this.add.sprite(attacker.x, attacker.y, special.asset.key));
+    this.setNearestTextureFilter(special.asset.key);
     sprite.setOrigin(0.5, 1);
     sprite.setDisplaySize(width, height);
     sprite.setDepth(7);

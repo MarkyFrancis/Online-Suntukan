@@ -350,8 +350,13 @@ const newFighterBase = (key: string) => `/assets/new_fighters/${key}`;
 const defaultSpecialFrameDurations = [...SPECIAL_FRAME_DURATIONS_MS];
 const defaultSpecialDurationMs = defaultSpecialFrameDurations.reduce((total, duration) => total + duration, 0);
 const defaultSpecialHitAtMs = defaultSpecialFrameDurations.slice(0, 3).reduce((total, duration) => total + duration, 0);
-const markKamehamehaFrameDurationsMs = [700, 2200, 7100, 4000, 500] as const;
+// Keep Mark's frame 3 as the main charge pose, but make the wait shorter and
+// easier to use in a match. Frame 4 remains the four-second beam release.
+const markKamehamehaFrameDurationsMs = [700, 2200, 5000, 4000, 500] as const;
 const markKamehamehaReleaseMs = markKamehamehaFrameDurationsMs.slice(0, 3).reduce((total, duration) => total + duration, 0);
+// Idjao's rush needs more readable pauses in both his main special and Partner
+// version. The impact remains frame 4, but its timing follows this sequence.
+const idjaoSpecialFrameDurationsMs = [700, 800, 950, 1100, 700] as const;
 
 function specialFrameNumbers(frameCount: number) {
   return Array.from({ length: frameCount }, (_value, index) => index + 1);
@@ -543,8 +548,12 @@ function framedSpecial(
   specialFrameCount = 5,
   frameFilePrefix = "frame_",
   frameFilePad = 0,
+  customFrameDurationsMs?: readonly number[],
 ): SpecialAssetManifest {
-  const frameDurationsMs = frameDurationsForCount(specialFrameCount);
+  const frameDurationsMs = customFrameDurationsMs
+    ? [...customFrameDurationsMs]
+    : frameDurationsForCount(specialFrameCount);
+  const hitAtMs = frameDurationsMs.slice(0, 3).reduce((total, duration) => total + duration, 0);
   return {
     name,
     effect,
@@ -563,7 +572,7 @@ function framedSpecial(
     impactHoldMs: SPECIAL_IMPACT_HOLD_MS,
     recoveryMs: SPECIAL_RECOVERY_MS,
     durationMs: frameDurationsMs.reduce((total, duration) => total + duration, 0),
-    hitAtMs: defaultSpecialHitAtMs,
+    hitAtMs,
     range,
     height: 170,
     knockback,
@@ -689,7 +698,21 @@ export const fighterManifests: FighterAssetManifest[] = [
       walk: frameAnimation("idjao", "walk", 6, 120, "walk_frames", "idjao_walk"),
     },
     throw: throwFrames("idjao", "right"),
-    special: framedSpecial("idjao", "Black Wigo Rush", "car-rush", "special_idjao", 860, 390, true, "right"),
+    special: framedSpecial(
+      "idjao",
+      "Black Wigo Rush",
+      "car-rush",
+      "special_idjao",
+      860,
+      390,
+      true,
+      "right",
+      `${fighterBase("idjao")}/special_idjao`,
+      5,
+      "frame_",
+      0,
+      idjaoSpecialFrameDurationsMs,
+    ),
     voices: {
       attack: [`${fighterBase("idjao")}/what after I saved u.m4a`],
       hurt: [`${fighterBase("idjao")}/what after I saved u.m4a`],
@@ -1031,6 +1054,7 @@ export const sfxManifest = {
 export const extraSfxManifest = {
   spawnEntrance: { key: "sfx-spawn-entrance", path: "/assets/sfx/tp_sound.mp3" },
   refereeAura: { key: "sfx-referee-aura", path: "/assets/referee/super_saiyan_aura.mp3" },
+  bodyThrowImpact: { key: "sfx-body-throw-impact", path: "/assets/sfx/body_throw_hit_ground.mp3" },
   karloExplosion: { key: "sfx-karlo-explosion", path: "/assets/fighters/karlo/special_karlo/explosion.mp3" },
   geraldExplosion: { key: "sfx-gerald-explosion", path: "/assets/new_fighters/gerald/special/explosion.mp3" },
   idjaoCarCrash: { key: "sfx-idjao-car-crash", path: "/assets/character_sfx/idjao/car_crash.mp3" },
@@ -1197,6 +1221,7 @@ export function allExtraSfxAssets(): { key: string; path: string }[] {
   return [
     extraSfxManifest.spawnEntrance,
     extraSfxManifest.refereeAura,
+    extraSfxManifest.bodyThrowImpact,
     extraSfxManifest.karloExplosion,
     extraSfxManifest.geraldExplosion,
     extraSfxManifest.idjaoCarCrash,

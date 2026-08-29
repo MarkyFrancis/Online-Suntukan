@@ -10,7 +10,9 @@ export const SPECIAL_METER_DEAL_GAIN = 16;
 export const SPECIAL_METER_BLOCKED_DEAL_GAIN = 8;
 export const SPECIAL_METER_TAKE_GAIN = 12;
 export const SPECIAL_METER_BLOCK_TAKE_GAIN = 7;
-export const ASSIST_CHARGE_TIME_MULTIPLIER = 2;
+// Partner was originally twice as slow as Special. Reduce that delay by 20%
+// while keeping it meaningfully slower than the normal meter.
+export const ASSIST_CHARGE_TIME_MULTIPLIER = 2 * 0.8;
 export const ASSIST_SPECIAL_DAMAGE = 30;
 export const ASSIST_SPECIAL_BLOCK_DAMAGE = 9;
 export const ASSIST_METER_TIME_GAIN_PER_SECOND = SPECIAL_METER_TIME_GAIN_PER_SECOND / ASSIST_CHARGE_TIME_MULTIPLIER;

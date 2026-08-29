@@ -1,0 +1,19 @@
+{
+  "name": "BSU ONLINE SUNTUKAN",
+  "short_name": "BSU Suntukan",
+  "description": "BSU ONLINE SUNTUKAN fighting game",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#05070d",
+  "theme_color": "#05070d",
+  "icons": [
+    {
+      "src": "/app_icon.png",
+      "sizes": "2048x2048",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

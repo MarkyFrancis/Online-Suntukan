@@ -92,7 +92,6 @@ type UiElements = {
   stageGrid: HTMLElement;
   stageName: HTMLElement;
   stageBack: HTMLButtonElement;
-  restartButton: HTMLButtonElement;
   p1Name: HTMLElement;
   p2Name: HTMLElement;
   p1Health: HTMLElement;
@@ -180,7 +179,6 @@ export class DomUi {
     this.elements.settingsClose.addEventListener("click", callbacks.closeSettings);
     this.elements.musicPrev.addEventListener("click", () => callbacks.changeMusic(-1));
     this.elements.musicNext.addEventListener("click", () => callbacks.changeMusic(1));
-    this.elements.restartButton.addEventListener("click", () => callbacks.pauseAction("restart-round"));
     this.elements.restartMatch.addEventListener("click", callbacks.restartMatch);
     this.elements.winnerMainMenu.addEventListener("click", callbacks.mainMenu);
     this.elements.characterBack.addEventListener("click", callbacks.backFromCharacters);
@@ -571,7 +569,6 @@ export class DomUi {
       stageGrid: this.mustGet("stage-grid"),
       stageName: this.mustGet("stage-name"),
       stageBack: this.mustGetButton("stage-back"),
-      restartButton: this.mustGetButton("restart-round"),
       p1Name: this.mustGet("p1-name"),
       p2Name: this.mustGet("p2-name"),
       p1Health: this.mustGet("p1-health"),
